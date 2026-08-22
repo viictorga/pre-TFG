@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: tfg-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: iot
+      POSTGRES_USER: tfg
+      POSTGRES_PASSWORD: tfg_pass
+    ports:
+      - "5432:5432"
+    # wal_level=logical ya deja Postgres listo para cuando conectemos Debezium (CDC)
+    command: ["postgres", "-c", "wal_level=logical"]
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tfg -d iot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Fase 2: CDC en streaming ---
+
+  zookeeper:
+    image: quay.io/debezium/zookeeper:2.7
+    container_name: tfg-zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: quay.io/debezium/kafka:2.7
+    container_name: tfg-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      ZOOKEEPER_CONNECT: zookeeper:2181
+    depends_on:
+      - zookeeper
+
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: tfg-connect
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_status
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+

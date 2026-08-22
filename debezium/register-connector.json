@@ -1,0 +1,17 @@
+{
+  "name": "iot-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "tfg",
+    "database.password": "tfg_pass",
+    "database.dbname": "iot",
+    "topic.prefix": "iot",
+    "table.include.list": "public.estado_dispositivo",
+    "plugin.name": "pgoutput",
+    "slot.name": "iot_slot",
+    "publication.autocreate.mode": "filtered",
+    "decimal.handling.mode": "double"
+  }
+}
