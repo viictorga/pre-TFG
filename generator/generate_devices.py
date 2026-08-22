@@ -11,6 +11,7 @@ Ya lleva integrado un parámetro de probabilidad de anomalía (PROB_ANOMALIA)
 para cuando llegue el momento de trabajar en la detección de anomalías: por
 ahora simplemente genera valores fuera de rango marcados en el log, sin que
 nada aguas abajo los procese todavía.
+.\venv\Scripts\Activate.ps1
 """
 
 import os
@@ -45,13 +46,16 @@ UBICACIONES = ["Almacen A", "Almacen B", "Oficina", "Exterior", "Sala servidores
 
 
 def crear_dispositivos():
+    # Determinista a propósito: el mismo id_dispositivo siempre obtiene el
+    # mismo tipo_sensor y ubicacion, incluso si el script se reinicia.
+    # Un sensor físico no cambia de tipo ni se teletransporta de sitio.
+    tipos = list(TIPOS_SENSOR.keys())
     dispositivos = []
     for i in range(1, NUM_DISPOSITIVOS + 1):
-        tipo = random.choice(list(TIPOS_SENSOR.keys()))
         dispositivos.append({
             "id_dispositivo": f"sensor-{i:03d}",
-            "tipo_sensor": tipo,
-            "ubicacion": random.choice(UBICACIONES),
+            "tipo_sensor": tipos[(i - 1) % len(tipos)],
+            "ubicacion": UBICACIONES[(i - 1) % len(UBICACIONES)],
         })
     return dispositivos
 
@@ -71,6 +75,8 @@ def upsert_lectura(cur, dispositivo, valor, unidad):
             (id_dispositivo, tipo_sensor, ubicacion, valor, unidad, estado, fecha_actualizacion)
         VALUES (%s, %s, %s, %s, %s, 'activo', %s)
         ON CONFLICT (id_dispositivo) DO UPDATE SET
+            tipo_sensor = EXCLUDED.tipo_sensor,
+            ubicacion = EXCLUDED.ubicacion,
             valor = EXCLUDED.valor,
             estado = 'activo',
             fecha_actualizacion = EXCLUDED.fecha_actualizacion
