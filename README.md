@@ -82,3 +82,6 @@ docker compose down -v    # para Postgres y borra los datos
 Con esto funcionando, el siguiente paso del cronograma es añadir Debezium +
 Kafka y comprobar que cada `UPDATE` sobre `estado_dispositivo` aparece como
 un evento CDC — todavía sin Spark ni Iceberg.
+
+
+# docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/read_kafka_console.py
