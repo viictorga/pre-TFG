@@ -1,5 +1,5 @@
 {
-  "name": "iot-connector",
+  "name": "fraude-connector",
   "config": {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
     "database.hostname": "postgres",
@@ -7,10 +7,10 @@
     "database.user": "tfg",
     "database.password": "tfg_pass",
     "database.dbname": "iot",
-    "topic.prefix": "iot",
-    "table.include.list": "public.estado_dispositivo",
+    "topic.prefix": "fraude",
+    "table.include.list": "public.estado_cuenta",
     "plugin.name": "pgoutput",
-    "slot.name": "iot_slot",
+    "slot.name": "fraude_slot",
     "publication.autocreate.mode": "filtered",
     "decimal.handling.mode": "double"
   }
