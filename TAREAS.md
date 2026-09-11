@@ -13,6 +13,14 @@ extremo**. Que el código exista no basta.
 
 ## 1. Resumen del estado
 
+Lo que yo haría, por orden a 11/09/26
+
+  1. Eventos rotos + DLQ. Cierra la fase 4 y es tu segunda aportación diferencial.
+  2. Ajustar el detector con el 4 % de anomalías, para que las métricas signifiquen algo.
+  3. gold + dbt. Es mucho más fácil de lo que parece: son ficheros SQL.
+  4. Los experimentos. Se pueden empezar ya, sin esperar al panel.
+  5. DuckDB y el panel. Lo último, porque es lo más prescindible si vas justo de tiempo
+
 El proyecto tiene un pipeline de datos funcionando de principio a fin, que ya
 produce métricas cuantitativas. El flujo actual es:
 
