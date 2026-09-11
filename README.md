@@ -255,6 +255,50 @@ docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kaf
 docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/detectar_anomalias.py
 ```
 
+#### Parámetros de configuración de la ingesta
+
+Los dos jobs de streaming aceptan dos variables de entorno que determinan juntas
+su capacidad de absorción. Son las dos palancas de configuración más
+directamente ligadas a la pregunta de investigación del TFG:
+
+| Variable | Por defecto | Qué hace |
+|---|---|---|
+| `MAX_OFFSETS_POR_TRIGGER` | sin límite | Máximo de eventos que entran en cada micro-lote |
+| `INTERVALO_TRIGGER_SEGUNDOS` | 10 en `bronze`, 15 en el detector | Cada cuánto se dispara un micro-lote |
+
+Juntas fijan el techo teórico de procesamiento del job:
+
+```text
+eventos/s = MAX_OFFSETS_POR_TRIGGER / INTERVALO_TRIGGER_SEGUNDOS
+```
+
+Se pasan al contenedor con `-e`:
+
+```bash
+docker exec -it -e MAX_OFFSETS_POR_TRIGGER=2000 -e INTERVALO_TRIGGER_SEGUNDOS=5 \
+  tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 \
+  /home/iceberg/scripts/read_kafka_to_bronze.py
+```
+
+**Sin `MAX_OFFSETS_POR_TRIGGER`, Spark consume en cada disparo todo lo que haya
+en Kafka.** Eso hace que un pico de carga se absorba entero de una vez y que el
+consumer lag valga cero por construcción. Al acotarlo, lo que excede se queda
+esperando y el lag pasa a medir exactamente el retraso acumulado.
+
+#### Detener un job correctamente
+
+Interrumpir el `docker exec` **no mata el proceso dentro del contenedor**: el
+driver de Spark sigue vivo y mantiene tomado el directorio de checkpoint, de modo
+que el siguiente job fallará con `SparkConcurrentModificationException`. Después
+de parar un job hay que rematarlo:
+
+```bash
+docker exec tfg-spark bash -c "pkill -f read_kafka_to_bronze"
+docker exec tfg-spark bash -c "ps -eo pid,etime,cmd | grep '[s]park-submit'"
+```
+
+La segunda orden no debe devolver nada.
+
 `read_kafka_to_bronze.py` y `detectar_anomalias.py` son **consumidores
 independientes del mismo topic** y están pensados para correr a la vez: el
 detector calcula la media y la desviación del importe de cada cuenta leyendo el

@@ -677,8 +677,28 @@ Los problemas técnicos relevantes son información útil para la memoria del TF
 - **Causa:** el lag se toma de `maxOffsetsBehindLatest`, que la fuente de Kafka calcula como la diferencia entre el último offset disponible y el último que el micro-lote ha leído. Como los jobs **no tienen configurado `maxOffsetsPerTrigger`**, Spark consume en cada micro-lote *todo* lo que hay disponible, así que ese valor es cero por definición. No mide que el sistema vaya holgado: mide una resta que siempre da cero.
 - **Corrección:** esto invalida lo que se había documentado antes, que presentaba el consumer lag como la señal principal de las pruebas de pico. **Con la configuración actual, el lag no sirve como indicador de saturación.**
 - **Qué usar en su lugar, mientras tanto:** `filas_entrada` por micro-lote, que sí refleja cuánto se ha acumulado entre disparos, y sobre todo la comparación entre `duracion_total_ms` y el intervalo del *trigger*. Mientras un micro-lote tarde menos que su intervalo, el job va al día; cuando lo supere de forma sostenida, se estará quedando atrás. En la prueba, los micro-lotes tardaron entre 927 y 1.074 ms frente a un trigger de 10 s: un margen de casi diez veces.
-- **Cómo hacer que el lag vuelva a ser informativo:** fijar `maxOffsetsPerTrigger` para acotar cuántos eventos entra en cada micro-lote. Entonces un pico que supere ese límite deja eventos esperando y el lag pasa a medir exactamente eso. **Y es, además, un excelente parámetro de configuración que estudiar** en la matriz de experimentos de la fase 10: relaciona directamente tamaño de micro-lote con latencia y con capacidad de absorción, que es el núcleo de la pregunta de investigación.
+- **Resuelto el 2026-09-11.** Los dos jobs de streaming aceptan ahora `MAX_OFFSETS_POR_TRIGGER` e `INTERVALO_TRIGGER_SEGUNDOS` como variables de entorno. Al acotar el micro-lote, lo que excede se queda esperando y el lag pasa a medir exactamente eso. Verificado: con el límite en 2.000 y un trigger de 5 s, el lag arrancó en 35.504 eventos y bajó en escalones de exactamente 2.000 por micro-lote hasta llegar a cero. Ver los resultados en la sección 8.
+- **Es además un buen parámetro de configuración que estudiar** en la matriz de experimentos de la fase 10: relaciona directamente el tamaño del micro-lote con la latencia y con la capacidad de absorción, que es el núcleo de la pregunta de investigación.
 - **Impacto en el TFG:** afecta al diseño de los experimentos de la fase 10 y a cómo se interpretan sus resultados. Un lag de cero no se puede presentar como prueba de que la plataforma aguanta si es cero por construcción.
+
+### [2026-09-11] `timeout` sobre `docker exec` deja drivers de Spark huérfanos
+
+- **Síntoma:** al lanzar un segundo job de `bronze`, este muere con `SparkConcurrentModificationException: Multiple streaming queries are concurrently using .../\_checkpoints/bronze_eventos_cuenta/offsets` y un `FileAlreadyExistsException` sobre un fichero de offsets.
+- **Causa:** `timeout 100 docker exec ... spark-submit` mata al **cliente** `docker exec` de la máquina anfitriona, pero **no al proceso que corre dentro del contenedor**. El driver de Spark sigue vivo, conserva su consulta de streaming en marcha y mantiene tomado el directorio de checkpoint. El job nuevo encuentra el checkpoint en uso y se niega a continuar, que es exactamente lo que debe hacer: dos consultas escribiendo el mismo checkpoint lo corromperían.
+- **Solución:** después de interrumpir un job así, matar explícitamente el proceso dentro del contenedor:
+
+  ```bash
+  docker exec tfg-spark bash -c "pkill -f read_kafka_to_bronze"
+  ```
+
+  Para comprobar si queda alguno vivo:
+
+  ```bash
+  docker exec tfg-spark bash -c "ps -eo pid,etime,cmd | grep '[s]park-submit'"
+  ```
+
+- **Efecto colateral que hubo que reparar:** el checkpoint quedó en un estado incoherente y hubo que borrarlo para que el job volviera a arrancar. Al hacerlo, el job reprocesa el tópico desde el principio y vuelve a insertar en `bronze` eventos ya persistidos.
+- **Impacto en el TFG:** afecta directamente a la fase 10. Si entre dos corridas de la matriz de experimentos queda un driver huérfano, la segunda corrida falla o, peor, mide con un competidor invisible consumiendo CPU. **Todo guion de experimentación debe terminar matando explícitamente los procesos dentro del contenedor**, no basta con cortar el `docker exec`.
 
 ### [2026-09-11] El generador es el cuello de botella, no la plataforma
 
@@ -743,6 +763,30 @@ Formato recomendado:
 ```
 
 Los datos utilizados en la memoria final deben proceder de pruebas reproducibles siempre que sea posible.
+
+### [2026-09-11] Prueba: el consumer lag con `maxOffsetsPerTrigger`
+
+Comprobación de que acotar el micro-lote convierte el consumer lag en una métrica informativa.
+
+- **Objetivo:** verificar que `MAX_OFFSETS_POR_TRIGGER` limita de verdad el micro-lote y que el lag refleja el retraso acumulado.
+- **Configuración:** `MAX_OFFSETS_POR_TRIGGER=2000`, `INTERVALO_TRIGGER_SEGUNDOS=5`. Techo teórico del job: 2.000 / 5 = **400 eventos/s**.
+- **Carga:** un tópico con 35.504 eventos acumulados, consumidos desde el principio.
+
+| Micro-lote | Filas de entrada | Throughput | Duración | Lag |
+|---|---|---|---|---|
+| 0 | 2.000 | 411 filas/s | 4.862 ms | **35.504** |
+| 1 | 2.000 | 1.810 filas/s | 1.105 ms | 33.504 |
+| 5 | 2.000 | 2.911 filas/s | 687 ms | 25.504 |
+| 10 | 2.000 | 3.067 filas/s | 652 ms | 15.504 |
+| 17 | 2.000 | 3.766 filas/s | 531 ms | 1.504 |
+| 18 | 1.504 | 1.525 filas/s | 986 ms | **0** |
+
+**Conclusiones:**
+
+1. **El límite se aplica con exactitud.** Todos los micro-lotes entran exactamente 2.000 filas, y el lag baja en escalones de exactamente 2.000. El drenaje de los 35.504 eventos acumulados costó 18 micro-lotes, es decir, unos 90 segundos a 400 eventos/s. El comportamiento es perfectamente predecible a partir de los dos parámetros.
+2. **El lag es ahora una métrica útil.** Pasa de 35.504 a 0 describiendo una rampa limpia. Con la configuración anterior habría valido 0 en todos los micro-lotes, sin informar de nada.
+3. **El cuello de botella pasa a ser la configuración, no la plataforma.** Spark proceso cada micro-lote en unos 600 ms, lo que da una capacidad real en torno a 3.000 filas/s, pero el job solo drena 400 eventos/s porque así lo fija la pareja de parámetros. Entre micro-lotes, el job pasa unos 4,4 de cada 5 segundos sin hacer nada. **Esto es exactamente lo que la pregunta de investigación quiere estudiar:** cómo un parámetro de configuración, y no el hardware, determina el rendimiento observado.
+4. **El primer micro-lote es siempre atípico.** 4.862 ms frente a los 600 ms del régimen estacionario, por el arranque en frío de la sesión de Spark. Confirma, ya con dos pruebas independientes, que el transitorio inicial debe descartarse al calcular medias.
 
 ### [2026-09-11] Prueba: primer pico de carga
 
@@ -1166,6 +1210,27 @@ FROM demo.bronze.eventos_cuenta;"
 ```
 
 **Precaución al interpretarlo:** el resultado incluye la espera del trigger (10 s en `bronze`) y, si el job arrancó con backlog acumulado, también el transitorio de arranque en frío. Conviene separar ambos efectos antes de dar la media por buena.
+
+### Detener un job de streaming correctamente
+
+**Objetivo:** parar un job de Spark sin dejar un driver huérfano.
+
+Interrumpir el `docker exec` (con `Ctrl+C` o con `timeout`) **no basta**: mata el cliente de la máquina anfitriona, pero el proceso sigue vivo dentro del contenedor y mantiene tomado el directorio de checkpoint. Después de interrumpirlo hay que rematarlo:
+
+```bash
+docker exec tfg-spark bash -c "pkill -f read_kafka_to_bronze"
+docker exec tfg-spark bash -c "pkill -f detectar_anomalias"
+```
+
+**Comprobación:**
+
+```bash
+docker exec tfg-spark bash -c "ps -eo pid,etime,cmd | grep '[s]park-submit'"
+```
+
+**Resultado esperado:** sin salida. Si aparece algún proceso, sigue vivo.
+
+**Precaución:** un driver huérfano hace que el siguiente job falle con `SparkConcurrentModificationException` sobre el checkpoint, y puede dejarlo en un estado del que solo se sale borrándolo. En la fase experimental, además, consumiría CPU compitiendo con la corrida que se está midiendo.
 
 ### Recoger CPU y memoria durante un experimento
 

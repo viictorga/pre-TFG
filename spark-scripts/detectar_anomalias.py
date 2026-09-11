@@ -26,9 +26,44 @@ una tercera terminal):
     docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/detectar_anomalias.py
 """
 
+import os
+
 from metricas import RegistradorDeMetricas
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
+
+# --- Parametros de configuracion de la ingesta ---
+#
+# Los dos determinan juntos la capacidad de absorcion del job, y son las dos
+# variables de configuracion mas directamente ligadas a la pregunta de
+# investigacion del TFG.
+#
+# MAX_OFFSETS_POR_TRIGGER acota cuantos eventos entra como maximo en cada
+# micro-lote. Sin el, Spark consume en cada disparo TODO lo que haya
+# disponible en Kafka, con dos consecuencias: un pico de carga se traga entero
+# de una vez, y el consumer lag vale cero por construccion (la resta entre el
+# ultimo offset disponible y el ultimo leido siempre da cero). Al acotarlo, lo
+# que excede se queda esperando y el lag pasa a medir exactamente eso.
+#
+# INTERVALO_TRIGGER_SEGUNDOS es cada cuanto se dispara un micro-lote. Junto al
+# limite anterior fija el techo teorico de procesamiento del job:
+#
+#     eventos/s = MAX_OFFSETS_POR_TRIGGER / INTERVALO_TRIGGER_SEGUNDOS
+#
+# Sin limite de offsets, ese techo lo marca en realidad lo que Spark tarde en
+# procesar el micro-lote.
+MAX_OFFSETS_POR_TRIGGER = os.getenv("MAX_OFFSETS_POR_TRIGGER")   # None = sin limite
+INTERVALO_TRIGGER_SEGUNDOS = os.getenv("INTERVALO_TRIGGER_SEGUNDOS", "15")
+
+
+def configurar_lector(lector):
+    """Aplica el limite de offsets por micro-lote, si se ha pedido uno."""
+    if MAX_OFFSETS_POR_TRIGGER:
+        print(f"[config] maxOffsetsPerTrigger = {MAX_OFFSETS_POR_TRIGGER}")
+        return lector.option("maxOffsetsPerTrigger", MAX_OFFSETS_POR_TRIGGER)
+    print("[config] maxOffsetsPerTrigger sin limite: el consumer lag valdra 0 por construccion")
+    return lector
+
 
 VENTANA_LECTURAS = 20   # cuantas transacciones historicas usar para media/desviacion
 Z_SCORE_UMBRAL = 3.0    # a partir de cuantas desviaciones se considera anomalia
@@ -107,14 +142,13 @@ envelope_schema = StructType([
     ])),
 ])
 
-raw = (
+raw = configurar_lector(
     spark.readStream
     .format("kafka")
     .option("kafka.bootstrap.servers", "kafka:9092")
     .option("subscribe", "fraude.public.estado_cuenta")
     .option("startingOffsets", "earliest")
-    .load()
-)
+).load()
 
 eventos = (
     raw.selectExpr("CAST(value AS STRING) AS json_str")
@@ -202,7 +236,7 @@ def procesar_lote(df_lote, id_lote):
 query = (
     eventos.writeStream
     .outputMode("append")
-    .trigger(processingTime="15 seconds")
+    .trigger(processingTime=f"{INTERVALO_TRIGGER_SEGUNDOS} seconds")
     .option("checkpointLocation", "/home/iceberg/warehouse/_checkpoints/silver_transacciones_validadas")
     .foreachBatch(procesar_lote)
     .start()

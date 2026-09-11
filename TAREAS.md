@@ -83,8 +83,8 @@ transacciones de card testing llegaron a `bronze` con un importe medio de 1,75 �
 ### Tres limitaciones que condicionan lo que queda
 
 - **Spark consume 4,2 de los 7,9 GiB disponibles para Docker.** Es el techo real de la máquina. Conviene comprobar que Airflow y Metabase caben antes de añadirlos.
-- **El consumer lag vale 0 por construcción.** Sin `maxOffsetsPerTrigger`, Spark consume en cada micro-lote todo lo disponible, así que la métrica siempre da cero, también durante un pico. No mide holgura: no mide nada. Para que informe hay que acotar el tamaño del micro-lote, lo que además convierte ese límite en un buen parámetro experimental.
-- **El generador es hoy el cuello de botella, no la plataforma.** Su techo está en unos 692 eventos/s, y Spark los procesó en micro-lotes de ~1 s frente a un *trigger* de 10 s. Para provocar degradación observable hay que estrechar el pipeline o acelerar el generador (inserciones por lotes, o varios procesos en paralelo).
+- **El consumer lag solo informa si se acota el micro-lote.** Sin `maxOffsetsPerTrigger`, Spark consume todo lo disponible en cada disparo y la métrica da cero por construcción. Ya está resuelto: los jobs aceptan `MAX_OFFSETS_POR_TRIGGER` e `INTERVALO_TRIGGER_SEGUNDOS`, y con ellos el lag describe una rampa limpia. **Hay que acordarse de fijarlos en cada experimento**, porque por defecto no hay límite.
+- **El generador es hoy el cuello de botella, no la plataforma.** Su techo está en unos 692 eventos/s, y Spark los procesó en micro-lotes de ~1 s frente a un *trigger* de 10 s. Para provocar degradación observable ya no hace falta acelerarlo: basta con estrangular el consumo acotando el micro-lote.
 
 ---
 
@@ -183,11 +183,11 @@ lo que estas tareas piden es medir *bajo carga*, no tener con qué medir.
 - [ ] **49. Implementar aislamiento de eventos corruptos.** Que un evento inválido acabe en la DLQ en vez de tumbar el job o desaparecer sin dejar rastro.
 - [ ] **50. Comprobar que un evento corrupto no detiene el pipeline.** Prueba explícita: inyectar corrupción con el pipeline en marcha y verificar que el resto del flujo sigue procesándose con normalidad.
 - [ ] **51. Implementar escenarios de pico de carga.** El modo de pico ya existe y se ha ejecutado una vez sobre el pipeline en marcha. Falta definir los escenarios concretos que entran en la evaluación y ejecutarlos de forma sistemática. **Antes hay que resolver el problema del techo del generador:** a 692 eventos/s la plataforma ni se inmuta, así que ese pico no llega a ser una prueba de estrés.
-- [ ] **52. Medir consumer lag.** La instrumentación existe, pero se ha descubierto que **el lag vale 0 por construcción**: sin `maxOffsetsPerTrigger`, Spark consume en cada micro-lote todo lo disponible y la métrica siempre da cero. Para que mida algo hay que acotar el tamaño del micro-lote, lo que de paso convierte ese límite en un parámetro experimental interesante.
+- [ ] **52. Medir consumer lag.** Instrumentado y ya **verificado como métrica útil**: con `MAX_OFFSETS_POR_TRIGGER=2000` y un trigger de 5 s, el lag arrancó en 35.504 eventos y bajó en escalones exactos de 2.000 hasta cero. Sin ese límite valdría 0 por construcción. Falta medirlo dentro de los escenarios de estrés de la evaluación.
 - [ ] **53. Medir throughput.** Instrumentado y registrado por micro-lote. Falta medirlo en condiciones de saturación.
 - [ ] **54. Medir latencia.** Calculable comparando `fecha_actualizacion` y `fecha_ingesta` en `bronze`. Falta medirla bajo carga y separando el transitorio de arranque del régimen estacionario.
 - [ ] **55. Comprobar pérdida de eventos.** Comparar los eventos generados con los persistidos más los enviados a la DLQ. **La dependencia ya está resuelta:** el generador escribe al terminar un resumen JSON con el recuento exacto de lo emitido, que es el dato que PostgreSQL no puede dar al usar el patrón *account shadow*. Falta la comparación en sí, y que exista la DLQ.
-- [ ] **56. Evaluar backpressure y capacidad de absorción.** Hasta dónde absorbe Kafka un pico sin que se pierda nada, y cómo se comporta Spark cuando el ritmo de llegada supera al de procesamiento.
+- [ ] **56. Evaluar backpressure y capacidad de absorción.** Hasta dónde absorbe Kafka un pico sin que se pierda nada, y cómo se comporta Spark cuando el ritmo de llegada supera al de procesamiento. **Ya hay con qué provocarlo:** acotando el micro-lote se estrangula el consumo a voluntad, sin necesidad de acelerar el generador.
 
 ### Fase 8 — Transformaciones ELT
 
@@ -224,7 +224,7 @@ existe para hacerla posible.
 - [ ] **72. Diseñar matriz de experimentos.** Qué combinaciones de carga y configuración se prueban, cuántas repeticiones y de qué duración. Debe ser limitada y reproducible: una matriz demasiado grande no cabe en el tiempo del TFG.
 - [ ] **73. Definir diferentes niveles de carga.** Eventos por segundo, número de cuentas e intensidad de los picos. Punto de partida conocido: con 20 eventos/s el sistema va sobrado y el lag es 0.
 - [ ] **74. Ejecutar pruebas de estrés.** Ejecución sistemática de la matriz, registrando la configuración exacta de cada corrida.
-- [ ] **75. Modificar parámetros de configuración seleccionados.** Candidatos: particiones de Kafka (hoy 1), tamaño del *trigger* de Spark (hoy 10 y 15 s), `VENTANA_LECTURAS` y `Z_SCORE_UMBRAL`. **Los dos últimos están hoy fijos en el código y habría que parametrizarlos** por variable de entorno para poder barrerlos.
+- [ ] **75. Modificar parámetros de configuración seleccionados.** Ya parametrizados y listos para barrer: `MAX_OFFSETS_POR_TRIGGER` e `INTERVALO_TRIGGER_SEGUNDOS` en los dos jobs, y en el generador el ritmo, la duración, la semilla y toda la configuración del pico. Quedan por parametrizar `VENTANA_LECTURAS` y `Z_SCORE_UMBRAL`, todavía fijos en el código, y por decidir si se estudian las particiones de Kafka (hoy 1).
 - [ ] **76. Medir latencia.** Bajo cada combinación de la matriz.
 - [ ] **77. Medir throughput.** Ídem.
 - [ ] **78. Medir CPU.** Con `scripts/recolectar_recursos.py`, ya operativo.
@@ -252,10 +252,10 @@ existe para hacerla posible.
 
 Por orden de prioridad:
 
-1. **Configurar `maxOffsetsPerTrigger` (tareas 52, 56, 75).** Es lo que convierte el consumer lag en una métrica con sentido y, de paso, añade un parámetro de configuración que relaciona tamaño de micro-lote con latencia y capacidad de absorción: justo el núcleo de la pregunta de investigación. Con el modo de pico ya construido, es el paso que hace que las pruebas de estrés midan algo.
-2. **Modo de eventos corruptos y DLQ (tareas 31, 48, 49, 50).** La segunda aportación diferencial del TFG. Antes hay que resolver la decisión de por dónde se inyecta la corrupción.
-3. **Calibrar el detector (tarea 45).** Repetir la medición con `PROB_ANOMALIA=0.04` para obtener una exhaustividad que signifique algo.
-4. **Parametrizar `VENTANA_LECTURAS` y `Z_SCORE_UMBRAL` (tarea 75).** Cinco minutos de trabajo que habilitan dos variables experimentales.
+1. **Modo de eventos corruptos y DLQ (tareas 31, 48, 49, 50).** La segunda aportación diferencial del TFG y lo único que queda de la fase 4. Antes hay que resolver la decisión de por dónde se inyecta la corrupción.
+2. **Calibrar el detector (tarea 45).** Repetir la medición con `PROB_ANOMALIA=0.04` para obtener una exhaustividad que signifique algo.
+3. **Parametrizar `VENTANA_LECTURAS` y `Z_SCORE_UMBRAL` (tarea 75).** Son las dos últimas constantes fijas en el código. Cinco minutos de trabajo que habilitan dos variables experimentales más.
+4. **Diseñar la matriz de experimentos (tarea 72).** Ya están parametrizadas las palancas principales —ritmo de generación, intensidad del pico, tamaño del micro-lote e intervalo del trigger— así que la matriz ya se puede definir sobre variables que existen de verdad.
 5. **Estado del arte y validación con el tutor (tareas 7 y 8).** No dependen del código y están en el camino crítico. Conviene avanzarlas en paralelo.
 
 ---
