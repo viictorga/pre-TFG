@@ -2,7 +2,7 @@
 Generador de transacciones bancarias sinteticas.
 
 Simula ~30 cuentas que actualizan su fila en "estado_cuenta" (patron
-device shadow) cada vez que hacen una nueva transaccion. Cada actualizacion
+account shadow) cada vez que hacen una nueva transaccion. Cada actualizacion
 es justo lo que Debezium capturara como evento CDC.
 
 Ya lleva integrado un parametro de probabilidad de anomalia (PROB_ANOMALIA):
@@ -10,12 +10,26 @@ genera transacciones con importes fuera de rango y, la mitad de las veces,
 tambien desde una ubicacion distinta a la habitual de esa cuenta (para mas
 adelante poder detectar "viajes imposibles").
 
+Cada transaccion se escribe acompanada de su ETIQUETA DE VERDAD (columnas
+es_anomalia_generada y tipo_anomalia_generada): el generador deja constancia
+de que inyecto a proposito como anomalo. Esa etiqueta es lo que permite
+calcular despues precision y exhaustividad, comparando lo que el pipeline
+detecto frente a lo que realmente se genero.
+
+La etiqueta viaja por el pipeline pero NINGUNA logica de deteccion puede
+leerla: el detector solo ve importe, cuenta y ubicacion, igual que ocurriria
+en un sistema real donde nadie sabe de antemano que transaccion es fraude.
+Solo se usa al final, al evaluar los resultados.
+
 Detalle importante: categoria_comercio solo tiene sentido en compras
 (online o presenciales). En una retirada de cajero o una transferencia no
 hay "comercio", asi que ese campo se manda como NULL -- no como texto
 vacio ni como un valor inventado tipo "n/a".
-.\venv\Scripts\Activate.ps1
 """
+
+# Recordatorio: activar antes el entorno virtual.
+#   PowerShell -> .\venv\Scripts\Activate.ps1
+#   bash       -> source venv/bin/activate
 
 import os
 import random
@@ -79,9 +93,9 @@ CIUDADES_ANOMALAS = ["Bangkok", "Lagos", "Moscu", "Ciudad de Mexico", "Manila"]
 
 
 def crear_cuentas():
-    # Determinista a proposito, igual que con los sensores: la misma
-    # cuenta siempre tiene la misma ciudad habitual, incluso si el script
-    # se reinicia.
+    # Determinista a proposito: la misma cuenta siempre tiene la misma
+    # ciudad habitual, incluso si el script se reinicia. Asi el "viaje
+    # imposible" de una anomalia es reproducible entre experimentos.
     cuentas = []
     for i in range(1, NUM_CUENTAS + 1):
         cuentas.append({
@@ -103,12 +117,22 @@ def generar_transaccion(cuenta, anomalo):
 
     # En una transaccion anomala, la mitad de las veces tambien salta la
     # ubicacion habitual de la cuenta (simulando un "viaje imposible").
-    if anomalo and random.random() < 0.5:
+    salto_ubicacion = anomalo and random.random() < 0.5
+    if salto_ubicacion:
         ubicacion = random.choice(CIUDADES_ANOMALAS)
     else:
         ubicacion = cuenta["ubicacion_habitual"]
 
     resultado = "rechazada" if random.random() < PROB_RECHAZO else "aprobada"
+
+    # Etiqueta de verdad: distinguimos los dos tipos de anomalia inyectada
+    # para poder medir por separado cuanto detecta el pipeline de cada uno.
+    if not anomalo:
+        tipo_anomalia = None
+    elif salto_ubicacion:
+        tipo_anomalia = "importe_ubicacion"
+    else:
+        tipo_anomalia = "importe"
 
     return {
         "tipo_transaccion": tipo_transaccion,
@@ -117,6 +141,8 @@ def generar_transaccion(cuenta, anomalo):
         "ubicacion": ubicacion,
         "importe": importe,
         "resultado": resultado,
+        "es_anomalia_generada": anomalo,
+        "tipo_anomalia_generada": tipo_anomalia,
     }
 
 
@@ -124,8 +150,8 @@ def upsert_transaccion(cur, cuenta, t):
     cur.execute(
         """
         INSERT INTO estado_cuenta
-            (id_cuenta, tipo_transaccion, categoria_comercio, canal, ubicacion, importe, moneda, resultado, estado, fecha_actualizacion)
-        VALUES (%s, %s, %s, %s, %s, %s, 'EUR', %s, 'activa', %s)
+            (id_cuenta, tipo_transaccion, categoria_comercio, canal, ubicacion, importe, moneda, resultado, estado, fecha_actualizacion, es_anomalia_generada, tipo_anomalia_generada)
+        VALUES (%s, %s, %s, %s, %s, %s, 'EUR', %s, 'activa', %s, %s, %s)
         ON CONFLICT (id_cuenta) DO UPDATE SET
             tipo_transaccion = EXCLUDED.tipo_transaccion,
             categoria_comercio = EXCLUDED.categoria_comercio,
@@ -135,7 +161,9 @@ def upsert_transaccion(cur, cuenta, t):
             moneda = EXCLUDED.moneda,
             resultado = EXCLUDED.resultado,
             estado = 'activa',
-            fecha_actualizacion = EXCLUDED.fecha_actualizacion
+            fecha_actualizacion = EXCLUDED.fecha_actualizacion,
+            es_anomalia_generada = EXCLUDED.es_anomalia_generada,
+            tipo_anomalia_generada = EXCLUDED.tipo_anomalia_generada
         """,
         (
             cuenta["id_cuenta"],
@@ -146,6 +174,8 @@ def upsert_transaccion(cur, cuenta, t):
             t["importe"],
             t["resultado"],
             datetime.now(timezone.utc),
+            t["es_anomalia_generada"],
+            t["tipo_anomalia_generada"],
         ),
     )
 
@@ -166,7 +196,7 @@ def main():
                 upsert_transaccion(cur, cuenta, t)
 
                 categoria_mostrar = t["categoria_comercio"] or "-"
-                marca = "  <-- ANOMALIA" if anomalo else ""
+                marca = f"  <-- ANOMALIA ({t['tipo_anomalia_generada']})" if anomalo else ""
                 marca += "  [RECHAZADA]" if t["resultado"] == "rechazada" else ""
                 print(
                     f"{cuenta['id_cuenta']:12s} {t['tipo_transaccion']:18s} "

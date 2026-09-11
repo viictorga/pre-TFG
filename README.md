@@ -131,9 +131,23 @@ NUM_CUENTAS=10 INTERVALO_SEGUNDOS=0.2 PROB_ANOMALIA=0.2 python generate_transact
 
 Una transacción anómala lleva un importe fuera del rango habitual de su tipo y,
 la mitad de las veces, también una ubicación distinta a la habitual de esa
-cuenta (base para detectar más adelante patrones de "viaje imposible"). Quien
-decide si una transacción es sospechosa es la capa de streaming, no el origen:
-el generador se limita a inyectar el importe fuera de rango.
+cuenta (base para detectar más adelante patrones de "viaje imposible").
+
+Quien decide si una transacción es sospechosa es la capa de streaming, no el
+origen: el generador se limita a inyectar el importe fuera de rango. Pero sí
+deja constancia de lo que inyectó, en dos columnas de **etiqueta de verdad**:
+
+| Columna | Valores | Para qué |
+|---|---|---|
+| `es_anomalia_generada` | `true` / `false` | Si el generador inyectó esta transacción como anómala |
+| `tipo_anomalia_generada` | `NULL`, `importe`, `importe_ubicacion` | Qué tipo de anomalía inyectó |
+
+Esa etiqueta viaja por todo el pipeline hasta la capa `silver`, donde queda
+junto a la predicción del detector (`es_anomalia`). Comparando ambas columnas se
+calculan precisión y exhaustividad. **Ninguna lógica de detección lee la
+etiqueta**: el z-score se calcula solo con el importe y el histórico de la
+cuenta, igual que en un sistema real, donde nadie sabe de antemano qué
+transacción es fraude.
 
 ## 4. Comprobar que los datos llegan
 
@@ -141,7 +155,7 @@ Estado de las cuentas en Postgres (una fila por cuenta):
 
 ```bash
 docker exec -it tfg-postgres psql -U tfg -d iot \
-  -c "SELECT id_cuenta, tipo_transaccion, importe, ubicacion FROM estado_cuenta ORDER BY fecha_actualizacion DESC LIMIT 10;"
+  -c "SELECT id_cuenta, tipo_transaccion, importe, ubicacion, es_anomalia_generada FROM estado_cuenta ORDER BY fecha_actualizacion DESC LIMIT 10;"
 ```
 
 Eventos CDC en Kafka:
@@ -196,6 +210,34 @@ docker exec -it tfg-spark spark-sql \
   -e "SELECT id_cuenta, importe, media_historica, z_score, es_anomalia FROM demo.silver.transacciones_validadas WHERE es_anomalia ORDER BY fecha_ingesta DESC LIMIT 20;"
 ```
 
+### Evaluar la detección
+
+La capa `silver` guarda una al lado de la otra la predicción del detector
+(`es_anomalia`) y la etiqueta de verdad del generador (`es_anomalia_generada`),
+así que la matriz de confusión sale de una sola consulta:
+
+```bash
+docker exec -it tfg-spark spark-sql -e "
+SELECT
+  count(*)                                                                      AS total,
+  sum(CASE WHEN es_anomalia     AND es_anomalia_generada     THEN 1 ELSE 0 END) AS verdaderos_positivos,
+  sum(CASE WHEN es_anomalia     AND NOT es_anomalia_generada THEN 1 ELSE 0 END) AS falsos_positivos,
+  sum(CASE WHEN NOT es_anomalia AND es_anomalia_generada     THEN 1 ELSE 0 END) AS falsos_negativos
+FROM demo.silver.transacciones_validadas;"
+```
+
+Y la exhaustividad desglosada por tipo de anomalía inyectada:
+
+```bash
+docker exec -it tfg-spark spark-sql -e "
+SELECT tipo_anomalia_generada,
+       count(*)                                     AS inyectadas,
+       sum(CASE WHEN es_anomalia THEN 1 ELSE 0 END) AS detectadas
+FROM demo.silver.transacciones_validadas
+WHERE es_anomalia_generada
+GROUP BY tipo_anomalia_generada;"
+```
+
 La consola web de MinIO está en <http://localhost:9001> (`admin` / `password`) y
 la interfaz de Spark en <http://localhost:8080>.
 
@@ -231,6 +273,9 @@ tomadas y su justificación, plan por fases y estado real del código.
 
 Funcionando: generador, CDC con Debezium, ingesta en Kafka, escritura en la capa
 `bronze` y detección de anomalías por z-score hacia `silver`.
+
+La etiqueta de verdad ya permite calcular precisión y exhaustividad de la
+detección sobre la capa `silver`.
 
 Pendiente: modos de pico de carga y de eventos corruptos en el generador, cola
 de eventos fallidos (DLQ), capa `gold`, transformaciones con dbt, orquestación

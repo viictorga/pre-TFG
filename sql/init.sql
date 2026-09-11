@@ -1,4 +1,4 @@
--- Tabla "device shadow" para cuentas bancarias: una fila por cuenta con su
+-- Tabla "account shadow" para cuentas bancarias: una fila por cuenta con su
 -- transaccion mas reciente. Cada UPDATE es justo lo que Debezium capturara
 -- como evento CDC.
 
@@ -12,7 +12,18 @@ CREATE TABLE IF NOT EXISTS estado_cuenta (
     moneda                  VARCHAR(5) NOT NULL DEFAULT 'EUR',
     resultado               VARCHAR(10) NOT NULL,    -- aprobada, rechazada
     estado                  VARCHAR(10) NOT NULL DEFAULT 'activa',  -- activa, bloqueada
-    fecha_actualizacion     TIMESTAMPTZ NOT NULL DEFAULT now()
+    fecha_actualizacion     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Etiqueta de verdad (ground truth). El generador deja constancia aqui de
+    -- que transacciones inyecto deliberadamente como anomalas, para poder
+    -- calcular despues precision y exhaustividad de la deteccion.
+    --
+    -- IMPORTANTE: ninguna logica de deteccion puede leer estas dos columnas.
+    -- Existen solo para evaluar el resultado a posteriori. Si el detector las
+    -- usara, el experimento perderia todo su valor: el origen no sabe que es
+    -- fraude, esa decision se toma en la capa de streaming.
+    es_anomalia_generada    BOOLEAN NOT NULL DEFAULT false,
+    tipo_anomalia_generada  VARCHAR(30)             -- NULL, 'importe' o 'importe_ubicacion'
 );
 
 CREATE INDEX IF NOT EXISTS idx_estado_cuenta_tipo ON estado_cuenta (tipo_transaccion);

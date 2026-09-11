@@ -6,6 +6,16 @@ ultimos N importes de ESA MISMA cuenta (usando el historial ya guardado en
 bronze) y la marca como anomalia si se aleja demasiado de esa media
 (z-score). El resultado se guarda en demo.silver.transacciones_validadas.
 
+La tabla silver arrastra tambien la etiqueta de verdad del generador
+(es_anomalia_generada / tipo_anomalia_generada) junto a la prediccion del
+detector (es_anomalia). Tener las dos columnas una al lado de la otra es lo
+que permite calcular directamente verdaderos positivos, falsos positivos y
+falsos negativos con una sola consulta.
+
+La etiqueta se copia, pero NO se usa para decidir: el z-score se calcula solo
+a partir del importe y del historico de la cuenta. Si la deteccion mirase la
+etiqueta, el experimento no mediria nada.
+
 Corre EN PARALELO al escritor de bronze (read_kafka_to_bronze.py) -- ambos
 son consumidores independientes del mismo topic de Kafka. Los dos deben
 estar corriendo a la vez.
@@ -41,11 +51,34 @@ spark.sql("""
         desviacion_historica DOUBLE,
         z_score DOUBLE,
         es_anomalia BOOLEAN,
+        es_anomalia_generada BOOLEAN,
+        tipo_anomalia_generada STRING,
         fecha_ingesta TIMESTAMP
     ) USING iceberg
 """)
 
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+def asegurar_columnas(spark, tabla, columnas):
+    """Anade a una tabla Iceberg ya existente las columnas que le falten.
+
+    CREATE TABLE IF NOT EXISTS no toca una tabla que ya existe, asi que una
+    tabla creada antes de anadir la etiqueta de verdad se quedaria sin esas
+    columnas y el append fallaria. Iceberg permite evolucionar el esquema sin
+    reescribir los datos: las filas antiguas devuelven NULL en la nueva.
+    """
+    existentes = {c.lower() for c in spark.table(tabla).columns}
+    for nombre, tipo in columnas:
+        if nombre.lower() not in existentes:
+            spark.sql(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
+            print(f"Esquema evolucionado: {tabla} + {nombre} {tipo}")
+
+
+asegurar_columnas(spark, "demo.silver.transacciones_validadas", [
+    ("es_anomalia_generada", "BOOLEAN"),
+    ("tipo_anomalia_generada", "STRING"),
+])
+
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType
 
 after_schema = StructType([
     StructField("id_cuenta", StringType()),
@@ -58,6 +91,9 @@ after_schema = StructType([
     StructField("resultado", StringType()),
     StructField("estado", StringType()),
     StructField("fecha_actualizacion", StringType()),
+    # Etiqueta de verdad: se lee para arrastrarla a silver, nunca para decidir.
+    StructField("es_anomalia_generada", BooleanType()),
+    StructField("tipo_anomalia_generada", StringType()),
 ])
 
 envelope_schema = StructType([
@@ -89,6 +125,8 @@ eventos = (
         col("evento.payload.after.moneda"),
         col("evento.payload.after.resultado"),
         col("evento.payload.after.fecha_actualizacion"),
+        col("evento.payload.after.es_anomalia_generada"),
+        col("evento.payload.after.tipo_anomalia_generada"),
     )
     .filter(col("id_cuenta").isNotNull())
 )
@@ -138,6 +176,8 @@ def procesar_lote(df_lote, id_lote):
                 WHEN h.desviacion_historica IS NULL OR h.desviacion_historica = 0 THEN false
                 ELSE ABS(l.importe - h.media_historica) / h.desviacion_historica > {Z_SCORE_UMBRAL}
             END AS es_anomalia,
+            l.es_anomalia_generada,
+            l.tipo_anomalia_generada,
             current_timestamp() AS fecha_ingesta
         FROM lote_actual l
         LEFT JOIN historico h ON l.id_cuenta = h.id_cuenta
@@ -149,7 +189,10 @@ def procesar_lote(df_lote, id_lote):
     n_anomalias = anomalias.count()
     if n_anomalias > 0:
         print(f"\n--- Lote {id_lote}: {n_anomalias} posible(s) fraude(s) detectado(s) ---")
-        anomalias.select("id_cuenta", "tipo_transaccion", "ubicacion", "importe", "media_historica", "z_score").show(truncate=False)
+        anomalias.select(
+            "id_cuenta", "tipo_transaccion", "ubicacion", "importe",
+            "media_historica", "z_score", "es_anomalia_generada",
+        ).show(truncate=False)
 
 
 query = (

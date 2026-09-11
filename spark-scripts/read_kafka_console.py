@@ -10,7 +10,7 @@ Ejecutar dentro del contenedor spark-iceberg (todo en una sola linea):
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType
 
 spark = SparkSession.builder.appName("LeerEventosCDC").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
@@ -26,6 +26,11 @@ after_schema = StructType([
     StructField("resultado", StringType()),
     StructField("estado", StringType()),
     StructField("fecha_actualizacion", StringType()),
+    # Etiqueta de verdad que inyecta el generador. Viaja por el pipeline para
+    # poder evaluar la deteccion a posteriori, pero la logica de deteccion
+    # NO puede usarla.
+    StructField("es_anomalia_generada", BooleanType()),
+    StructField("tipo_anomalia_generada", StringType()),
 ])
 
 envelope_schema = StructType([
@@ -56,6 +61,8 @@ eventos = (
         col("evento.payload.after.ubicacion"),
         col("evento.payload.after.importe"),
         col("evento.payload.after.resultado"),
+        col("evento.payload.after.es_anomalia_generada"),
+        col("evento.payload.after.tipo_anomalia_generada"),
     )
 )
 

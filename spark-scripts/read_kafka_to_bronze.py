@@ -16,7 +16,7 @@ Ejecutar dentro del contenedor spark-iceberg (todo en una sola linea):
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, current_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType
 
 spark = SparkSession.builder.appName("EscribirBronze").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
@@ -34,10 +34,34 @@ spark.sql("""
         resultado STRING,
         estado STRING,
         fecha_actualizacion STRING,
+        es_anomalia_generada BOOLEAN,
+        tipo_anomalia_generada STRING,
         operacion STRING,
         fecha_ingesta TIMESTAMP
     ) USING iceberg
 """)
+
+
+def asegurar_columnas(spark, tabla, columnas):
+    """Anade a una tabla Iceberg ya existente las columnas que le falten.
+
+    CREATE TABLE IF NOT EXISTS no toca una tabla que ya existe, asi que una
+    tabla creada antes de anadir la etiqueta de verdad se quedaria sin esas
+    columnas y el append fallaria. Iceberg permite evolucionar el esquema sin
+    reescribir los datos: las filas antiguas devuelven NULL en la columna
+    nueva.
+    """
+    existentes = {c.lower() for c in spark.table(tabla).columns}
+    for nombre, tipo in columnas:
+        if nombre.lower() not in existentes:
+            spark.sql(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
+            print(f"Esquema evolucionado: {tabla} + {nombre} {tipo}")
+
+
+asegurar_columnas(spark, "demo.bronze.eventos_cuenta", [
+    ("es_anomalia_generada", "BOOLEAN"),
+    ("tipo_anomalia_generada", "STRING"),
+])
 
 after_schema = StructType([
     StructField("id_cuenta", StringType()),
@@ -50,6 +74,11 @@ after_schema = StructType([
     StructField("resultado", StringType()),
     StructField("estado", StringType()),
     StructField("fecha_actualizacion", StringType()),
+    # Etiqueta de verdad que inyecta el generador. Viaja por el pipeline para
+    # poder evaluar la deteccion a posteriori, pero la logica de deteccion
+    # NO puede usarla.
+    StructField("es_anomalia_generada", BooleanType()),
+    StructField("tipo_anomalia_generada", StringType()),
 ])
 
 envelope_schema = StructType([
@@ -82,6 +111,8 @@ eventos = (
         col("evento.payload.after.resultado"),
         col("evento.payload.after.estado"),
         col("evento.payload.after.fecha_actualizacion"),
+        col("evento.payload.after.es_anomalia_generada"),
+        col("evento.payload.after.tipo_anomalia_generada"),
         col("evento.payload.op").alias("operacion"),
         current_timestamp().alias("fecha_ingesta"),
     )
