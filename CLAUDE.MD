@@ -346,14 +346,16 @@ Las fases son provisionales y pueden modificarse.
 
 Una fase solo debe marcarse como completada cuando haya sido **probada y funcione de extremo a extremo**, no simplemente porque el código exista.
 
+**Estado a 2026-09-11.** Completas y verificadas: la **fase 3** (entorno base) y la **fase 6** (detección de anomalías, a falta de calibrar el umbral). Parciales: la **fase 1** (faltan el estado del arte, la validación con el tutor y la arquitectura definitiva), la **fase 4** (faltan los modos de pico de carga y de eventos corruptos) y la **fase 5** (falta separar los eventos corruptos). Sin empezar: las fases 2, 8, 9, 10 y 11. La **fase 7** tiene ya la instrumentación de medida construida, pero ningún escenario de estrés ejecutado.
+
 ## Fase 1 — Definición y estado del arte
 
-- [ ] Definir enfoque principal en Ingeniería de Datos.
-- [ ] Decidir que la plataforma será el protagonista del TFG.
-- [ ] Definir una pregunta de investigación provisional.
-- [ ] Establecer como requisito que todo el proyecto sea gratuito.
-- [ ] Establecer Docker como entorno de despliegue.
-- [ ] Confirmar el caso de uso (detección de fraude en transacciones bancarias simuladas) como definitivo.
+- [x] Definir enfoque principal en Ingeniería de Datos.
+- [x] Decidir que la plataforma será el protagonista del TFG.
+- [x] Definir una pregunta de investigación provisional.
+- [x] Establecer como requisito que todo el proyecto sea gratuito.
+- [x] Establecer Docker como entorno de despliegue.
+- [x] Confirmar el caso de uso (detección de fraude en transacciones bancarias simuladas) como definitivo.
 - [ ] Completar el estado del arte.
 - [ ] Validar definitivamente el alcance con el tutor.
 - [ ] Diseñar la arquitectura técnica definitiva.
@@ -376,48 +378,48 @@ Una fase solo debe marcarse como completada cuando haya sido **probada y funcion
 
 ## Fase 3 — Entorno base
 
-- [ ] Configurar Docker Compose.
-- [ ] Configurar PostgreSQL.
-- [ ] Configurar Kafka o Redpanda.
-- [ ] Configurar MinIO.
-- [ ] Comprobar comunicación entre servicios.
-- [ ] Documentar cómo levantar y detener el entorno.
+- [x] Configurar Docker Compose.
+- [x] Configurar PostgreSQL.
+- [x] Configurar Kafka o Redpanda.
+- [x] Configurar MinIO.
+- [x] Comprobar comunicación entre servicios.
+- [x] Documentar cómo levantar y detener el entorno.
 
 **Entregable:** entorno de desarrollo funcional.
 
 ## Fase 4 — Generador de datos y CDC
 
-- [ ] Implementar generador de datos de transacciones bancarias.
-- [ ] Implementar generación de eventos normales.
-- [ ] Implementar inyección controlada de anomalías.
+- [x] Implementar generador de datos de transacciones bancarias.
+- [x] Implementar generación de eventos normales.
+- [x] Implementar inyección controlada de anomalías.
 - [ ] Implementar modo de pico de carga.
 - [ ] Implementar modo de eventos corruptos.
-- [ ] Configurar Debezium.
-- [ ] Comprobar captura de INSERT/UPDATE.
-- [ ] Comprobar publicación correcta en Kafka.
+- [x] Configurar Debezium.
+- [x] Comprobar captura de INSERT/UPDATE.
+- [x] Comprobar publicación correcta en Kafka.
 
 **Entregable:** datos sintéticos capturados como eventos CDC.
 
 ## Fase 5 — Streaming y capa Bronze
 
-- [ ] Implementar Spark Structured Streaming.
-- [ ] Consumir eventos desde Kafka.
+- [x] Implementar Spark Structured Streaming.
+- [x] Consumir eventos desde Kafka.
 - [ ] Validar estructura de eventos.
 - [ ] Separar eventos válidos y corruptos.
-- [ ] Implementar escritura en Iceberg.
-- [ ] Construir capa `bronze`.
+- [x] Implementar escritura en Iceberg.
+- [x] Construir capa `bronze`.
 
 **Entregable:** pipeline streaming funcional hasta `bronze`.
 
 ## Fase 6 — Detección de anomalías
 
-- [ ] Definir método estadístico.
-- [ ] Implementar estadísticas por ventana.
-- [ ] Calcular media.
-- [ ] Calcular desviación.
-- [ ] Definir umbral inicial mediante z-score.
-- [ ] Marcar eventos normales/anómalos.
-- [ ] Generar información suficiente para evaluar precisión y exhaustividad.
+- [x] Definir método estadístico.
+- [x] Implementar estadísticas por ventana.
+- [x] Calcular media.
+- [x] Calcular desviación.
+- [x] Definir umbral inicial mediante z-score.
+- [x] Marcar eventos normales/anómalos.
+- [x] Generar información suficiente para evaluar precisión y exhaustividad.
 
 **Entregable:** detección de anomalías en tiempo real.
 
