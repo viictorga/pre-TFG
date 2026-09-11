@@ -593,6 +593,43 @@ No registrar únicamente que "se arregló".
 
 Los problemas técnicos relevantes son información útil para la memoria del TFG y deben documentarse.
 
+### [2026-09-11] Los README describían un caso de uso que ya no existía
+
+- **Síntoma:** `README.md` y `debezium/README.md` daban instrucciones que no funcionaban: hablaban de sensores IoT, de la tabla `estado_dispositivo`, del script `generate_devices.py`, del conector `iot-connector` y del tópico `iot.public.estado_dispositivo`. Ninguno de esos nombres existe ya en el código.
+- **Causa:** el proyecto cambió de dominio en el commit `af4c05a`, de sensores IoT a transacciones bancarias, y se actualizó el código pero no la documentación.
+- **Solución:** reescritura completa de ambos. `README.md` documenta ahora la plataforma entera y `debezium/README.md` deja de duplicarlo para centrarse solo en el CDC.
+- **Resultado:** el procedimiento de registro del conector se ejecutó de principio a fin para comprobarlo: devuelve `201 Created` y deja el conector y su tarea en `RUNNING`.
+- **Impacto en el TFG:** ninguno sobre la arquitectura. Recuerda que la documentación forma parte del entregable de reproducibilidad: si el README no funciona, el criterio de la sección 12 no se cumple por mucho que el código sí funcione.
+
+### [2026-09-11] Git Bash rompe los `docker exec` con rutas absolutas
+
+- **Síntoma:** `docker exec tfg-kafka /kafka/bin/kafka-topics.sh ...` falla con `stat C:/Program Files/Git/kafka/bin/kafka-topics.sh: no such file or directory`.
+- **Causa:** Git Bash sobre Windows convierte automáticamente los argumentos que parecen rutas Unix a rutas Windows. La ruta `/kafka/bin/...` es interna del contenedor, pero Git Bash no tiene forma de saberlo y la reescribe antes de que Docker la reciba.
+- **Solución:** exportar `MSYS_NO_PATHCONV=1` antes de ejecutar esos comandos, o usarlos desde PowerShell, donde el problema no existe.
+- **Impacto en el TFG:** ninguno sobre la arquitectura, pero afecta a la reproducibilidad en Windows y por eso está documentado en el `README.md`.
+
+### [2026-09-11] Las herramientas de consola de Kafka no encuentran el broker con `localhost`
+
+- **Síntoma:** `kafka-topics.sh --bootstrap-server localhost:9092` ejecutado **dentro** del contenedor `tfg-kafka` reintenta durante un minuto con `Connection to node -1 (localhost/127.0.0.1:9092) could not be established` y acaba en `TimeoutException`.
+- **Causa:** el broker anuncia su dirección con el nombre de servicio de la red de Docker, no con `localhost`. El cliente se conecta, recibe los metadatos del clúster y a partir de ahí intenta hablar con una dirección que no resuelve.
+- **Solución:** usar `--bootstrap-server kafka:9092` dentro del contenedor. Verificado: devuelve la lista de tópicos al instante.
+- **Impacto en el TFG:** afecta a todos los comandos de diagnóstico de Kafka, incluidos los que harán falta en la fase de evaluación. Documentado en el `README.md` y en `debezium/README.md`.
+
+### [2026-09-11] Replication slot huérfano del conector anterior
+
+- **Síntoma:** `SELECT slot_name, active FROM pg_replication_slots;` devuelve dos slots: `fraude_slot` (activo, el actual) e `iot_slot` (inactivo).
+- **Causa:** `iot_slot` lo creó el conector del caso de uso IoT anterior. Eliminar un conector de Debezium no elimina su replication slot en PostgreSQL.
+- **Estado:** **sin resolver, pendiente de decisión del usuario.** No se ha eliminado porque borrar un slot es una operación destructiva sobre la base de datos.
+- **Por qué importa:** un slot inactivo hace que PostgreSQL conserve indefinidamente todos los segmentos del WAL que ese slot todavía no ha consumido. El disco crece sin causa aparente y, en el peor caso, la base de datos se queda sin espacio. En un TFG cuya evaluación consiste en generar mucho volumen de eventos, no es un detalle menor.
+- **Solución propuesta:** `SELECT pg_drop_replication_slot('iot_slot');`, solo tras confirmación.
+
+### [2026-09-11] MinIO no tiene volumen persistente
+
+- **Síntoma:** el servicio `minio` del `docker-compose.yml` no declara ningún `volumes:`, así que `/data` vive en la capa de escritura del contenedor.
+- **Consecuencia:** todo el lakehouse (las tablas Iceberg de `bronze` y `silver`) desaparece con un `docker compose down`, aunque no se use `-v`. Solo sobrevive a `docker compose stop`.
+- **Estado:** **sin resolver, pendiente de decisión del usuario**, porque añadir un volumen modifica la configuración de la plataforma.
+- **Impacto en el TFG:** afecta directamente a la reproducibilidad de los experimentos. Un resultado experimental que no se puede volver a consultar tras reiniciar el entorno es difícil de defender. Conviene resolverlo antes de la fase 10.
+
 ---
 
 # 8. Pruebas y resultados
@@ -636,6 +673,49 @@ Formato recomendado:
 ```
 
 Los datos utilizados en la memoria final deben proceder de pruebas reproducibles siempre que sea posible.
+
+### [2026-09-11] Prueba: primera medición de detección, throughput y latencia
+
+Primera vez que el pipeline produce números y no solo trazas por consola. Es una prueba de verificación de la instrumentación, no un experimento formal: sirve para comprobar que todo se mide, y de paso deja una línea base.
+
+- **Objetivo:** comprobar que la etiqueta de verdad permite calcular precisión y exhaustividad, y que el listener de métricas y el muestreo de recursos registran datos utilizables.
+- **Configuración:** entorno completo en Docker. Trigger de `bronze` a 10 s, trigger del detector a 15 s, `VENTANA_LECTURAS=20`, `Z_SCORE_UMBRAL=3.0`. Tópico Kafka con 1 partición.
+- **Carga:** dos tramos. Primero 10 cuentas con un evento cada 0,2 s y `PROB_ANOMALIA=0.3`; después 20 cuentas con un evento cada 0,05 s y `PROB_ANOMALIA=0.15`.
+
+**Métricas de detección** (sobre las 242 primeras transacciones, con `PROB_ANOMALIA=0.3`):
+
+| Métrica | Valor |
+|---|---|
+| Transacciones evaluadas | 242 |
+| Anomalías inyectadas | 75 |
+| Verdaderos positivos | 7 |
+| Falsos positivos | 0 |
+| Falsos negativos | 68 |
+| Precisión | 100 % |
+| Exhaustividad (recall) | 9,3 % |
+
+Desglose por tipo de anomalía inyectada: 3 detectadas de 32 de tipo `importe`, 4 de 43 de tipo `importe_ubicacion`.
+
+**Métricas de rendimiento** (13 micro-lotes del job de `bronze`):
+
+| Métrica | Valor |
+|---|---|
+| Throughput | entre 114 y 339 filas/s |
+| Duración del micro-lote | entre 566 y 3.929 ms |
+| Consumer lag máximo | 0 |
+| Latencia media de extremo a extremo | 10,89 s sobre 2.511 eventos |
+| Latencia máxima | 87 s |
+| Pico de CPU de `tfg-spark` | 744 % (más de 7 núcleos) |
+| Memoria de `tfg-spark` | 4.233 MiB de 7.900 MiB disponibles (53 %) |
+
+**Conclusiones:**
+
+1. **La exhaustividad es malísima y la causa es metodológica, no un fallo del código.** Con un 30 % de transacciones anómalas, las propias anomalías dominan la media y la desviación típica que el detector calcula sobre las últimas 20 transacciones de cada cuenta. El umbral de z-score 3,0 se vuelve casi inalcanzable porque la desviación está inflada por lo que se pretende detectar. Es un caso de libro de contaminación de la línea base, y respalda la elección de la propuesta de inyectar solo un 3-5 % de anomalías. **Hay que repetir la medición con `PROB_ANOMALIA` en su valor por defecto de 0,04 antes de sacar cualquier conclusión sobre la calidad del detector.**
+2. **La precisión del 100 % con 0 falsos positivos no es tan buena noticia como parece:** es coherente con un umbral demasiado conservador, que solo dispara ante lo extremadamente evidente. Precisión y exhaustividad hay que leerlas juntas.
+3. **La latencia media de 10,89 s es esencialmente el trigger de 10 s**, no un límite del sistema: un evento que llega justo después de un micro-lote espera al siguiente. Confirma que el tamaño del trigger es uno de los parámetros de configuración con efecto más directo sobre la latencia, y por tanto un buen candidato para la matriz de experimentos.
+4. **La latencia máxima de 87 s corresponde al arranque en frío**, cuando el job consume de golpe el backlog acumulado con `startingOffsets: earliest`. Al analizar los resultados hay que separar el transitorio de arranque del régimen estacionario, o las medias salen distorsionadas.
+5. **El lag se mantuvo en 0 todo el tiempo:** con 20 eventos/s el sistema va sobrado, así que esta carga no sirve como prueba de estrés. Habrá que subirla bastante hasta ver degradación, tal como anticipaba la sección 16 de riesgos.
+6. **`tfg-spark` consume más de la mitad de la memoria disponible para Docker.** Es el componente que marcará el techo de los experimentos en esta máquina, y conviene tenerlo presente al diseñar la matriz de carga.
 
 ---
 
@@ -681,6 +761,49 @@ fix: evita pérdida de eventos en la DLQ
 test: añade prueba de throughput del pipeline
 docs: documenta decisión sobre almacenamiento
 ```
+
+## Protocolo de entrega de cambios (checkpoints)
+
+Esta es una norma fija de trabajo, establecida por el usuario, y se aplica a
+**todos** los cambios del proyecto.
+
+El trabajo avanza por **checkpoints pequeños**. Cada cambio mínimamente
+completo se cierra antes de empezar el siguiente, en lugar de acumular muchas
+modificaciones y entregarlas todas juntas al final. Un checkpoint es una
+unidad que se sostiene por sí sola: se puede revisar, probar y revertir sin
+arrastrar nada más.
+
+En cada checkpoint hay que hacer tres cosas, siempre en este orden:
+
+1. **Verificar el cambio.** Siempre que el entorno lo permita, ejecutarlo de
+   verdad y comprobar el resultado, en vez de darlo por bueno porque el código
+   exista. Es la misma regla de la sección 19 sobre el estado de las fases.
+2. **Hacer un commit local**, con Conventional Commits en español y un cuerpo
+   que explique qué se ha hecho y por qué. **Nunca hacer `git push`**: el
+   usuario revisa el código y publica los cambios él mismo. Esa separación es
+   deliberada, y el commit es precisamente el punto de control que le permite
+   revisar un cambio aislado antes de publicarlo.
+3. **Devolverle la explicación por escrito** en la respuesta, para que pueda
+   leerla sin abrir el repositorio.
+
+### Estructura de la explicación
+
+Cada cambio se explica por completo, siguiendo esta estructura:
+
+- **Qué se ha hecho.** El cambio concreto, en lenguaje claro.
+- **Por qué.** El problema que resuelve o la necesidad que cubre. Esta parte es
+  la más importante: es la que acaba convirtiéndose en texto de la memoria.
+- **Qué alternativas se consideraron** y por qué se descartaron, cuando había
+  una decisión real que tomar.
+- **Cómo se ha verificado**, con los datos concretos obtenidos.
+- **Qué impacto tiene** sobre la arquitectura, el alcance o las fases.
+- **Qué queda pendiente** o qué decisión necesita el usuario.
+
+No basta con dejar la explicación en el mensaje del commit o en este archivo:
+el usuario quiere leerla en la respuesta. El motivo es doble. Por un lado, es
+la forma en que sigue y valida lo que se está construyendo sin tener que
+reconstruirlo leyendo diffs. Por otro, esas explicaciones son materia prima
+directa para la memoria académica del TFG, según la sección 17.
 
 ## Ramas
 
@@ -876,6 +999,101 @@ docker compose logs -f <servicio>
 ```
 
 **Uso:** diagnóstico y seguimiento de errores de un servicio concreto.
+
+### Levantar el pipeline completo (procedimiento verificado el 2026-09-11)
+
+**Objetivo:** poner en marcha todo el flujo, de generador a capa silver.
+
+**Requiere:** Docker en marcha y el entorno virtual de `generator/` creado.
+
+Orden de ejecución, cada bloque en su propia terminal:
+
+```bash
+# 1. Servicios
+docker compose up -d
+
+# 2. Conector CDC (esperar 20-30 s a que tfg-connect arranque del todo)
+curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json"   localhost:8083/connectors/ -d @debezium/register-connector.json
+curl -s localhost:8083/connectors/fraude-connector/status
+
+# 3. Generador
+python generator/generate_transactions.py
+
+# 4. Capa bronze
+docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/read_kafka_to_bronze.py
+
+# 5. Detección de anomalías
+docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/detectar_anomalias.py
+```
+
+**Resultado esperado:** el registro del conector devuelve `201 Created` y, al consultar su estado, tanto el conector como su tarea aparecen en `RUNNING`. Los dos jobs de Spark imprimen `[metricas] <job>: escribiendo en ...` al arrancar.
+
+**Precaución:** el paso 5 necesita que el paso 4 haya escrito ya algo en `bronze`, porque el detector calcula la media y la desviación a partir de ese histórico. En un entorno recién levantado, los primeros micro-lotes del detector no marcarán nada.
+
+### Kafka: usar `kafka:9092`, nunca `localhost:9092`
+
+Dentro del contenedor `tfg-kafka`, las herramientas de consola deben apuntar al nombre de servicio:
+
+```bash
+docker exec tfg-kafka /kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+```
+
+Con `localhost:9092` el cliente reintenta durante un minuto y acaba en `TimeoutException`. El motivo está explicado en la sección 7.
+
+### Git Bash en Windows: `MSYS_NO_PATHCONV=1`
+
+Antes de cualquier `docker exec` que invoque una ruta absoluta dentro del contenedor:
+
+```bash
+export MSYS_NO_PATHCONV=1
+```
+
+Sin esto, Git Bash reescribe `/kafka/bin/...` como ruta de Windows y el comando falla. En PowerShell no hace falta.
+
+### Evaluar la detección
+
+**Objetivo:** obtener la matriz de confusión. **Requiere** datos en `demo.silver.transacciones_validadas`.
+
+```bash
+docker exec -it tfg-spark spark-sql -e "
+SELECT
+  count(*)                                                                      AS total,
+  sum(CASE WHEN es_anomalia     AND es_anomalia_generada     THEN 1 ELSE 0 END) AS verdaderos_positivos,
+  sum(CASE WHEN es_anomalia     AND NOT es_anomalia_generada THEN 1 ELSE 0 END) AS falsos_positivos,
+  sum(CASE WHEN NOT es_anomalia AND es_anomalia_generada     THEN 1 ELSE 0 END) AS falsos_negativos
+FROM demo.silver.transacciones_validadas;"
+```
+
+### Medir latencia de extremo a extremo
+
+```bash
+docker exec -it tfg-spark spark-sql -e "
+SELECT
+  round(avg(unix_timestamp(fecha_ingesta) - unix_timestamp(to_timestamp(fecha_actualizacion))), 2) AS latencia_media_s,
+  round(max(unix_timestamp(fecha_ingesta) - unix_timestamp(to_timestamp(fecha_actualizacion))), 2) AS latencia_maxima_s,
+  count(*) AS eventos
+FROM demo.bronze.eventos_cuenta;"
+```
+
+**Precaución al interpretarlo:** el resultado incluye la espera del trigger (10 s en `bronze`) y, si el job arrancó con backlog acumulado, también el transitorio de arranque en frío. Conviene separar ambos efectos antes de dar la media por buena.
+
+### Recoger CPU y memoria durante un experimento
+
+```bash
+python scripts/recolectar_recursos.py --intervalo 5 --duracion 300 --etiqueta pico_carga
+```
+
+Escribe `warehouse/_metricas/pico_carga_<marca>.csv`, una fila por contenedor y muestra. Con `--duracion 0` muestrea hasta `Ctrl+C`.
+
+**Precaución:** `docker stats` consume CPU. Por debajo de uno o dos segundos de intervalo, la medición contamina lo medido.
+
+### Comprobar los replication slots de PostgreSQL
+
+```bash
+docker exec -it tfg-postgres psql -U tfg -d iot   -c "SELECT slot_name, active, restart_lsn FROM pg_replication_slots;"
+```
+
+**Para qué:** un slot inactivo retiene segmentos del WAL indefinidamente y el disco crece sin causa aparente. Conviene revisarlo si PostgreSQL empieza a ocupar más de lo esperado, y siempre después de eliminar un conector.
 
 ## Organización
 
@@ -1289,8 +1507,8 @@ Pendiente de implementar (no existe ni una versión mínima):
 2. **Modo de eventos corruptos** en el generador. Hoy es imposible generar un evento malformado: el `INSERT` pasa por un esquema tipado de Postgres, así que **la corrupción no puede inyectarse en el origen tal y como está montado**. Habrá que decidir dónde se inyecta (por ejemplo, un productor Kafka paralelo que escriba directamente en el tópico, o campos de texto libre en la tabla). Es una decisión de diseño abierta y debe consultarse con el usuario.
 3. **Dead-letter queue.** No existe. Los scripts actuales hacen `filter(col("id_cuenta").isNotNull())`, es decir, **descartan silenciosamente** lo que no encaja en el esquema en vez de aislarlo y contabilizarlo. Descartar no es lo mismo que aislar: la DLQ debe conservar el evento y su motivo de fallo.
 4. **Capa gold**, **dbt Core**, **Airflow**, **DuckDB** y **dashboard**. Ninguno está en `docker-compose.yml`.
-5. **Instrumentación de métricas.** No hay nada que mida throughput, latencia, consumer lag, CPU ni RAM. La pregunta de investigación depende de esto, así que decidir cómo se recogen las métricas (por ejemplo, `kafka-consumer-groups.sh`, el `StreamingQueryListener` de Spark, `docker stats`, o Prometheus + Grafana) es la decisión pendiente más urgente después del diseño.
-6. **Etiqueta de verdad (ground truth).** El generador sabe qué transacciones marcó como anómalas, pero **no persiste esa etiqueta en ningún sitio**: la columna no existe en `estado_cuenta`. Sin ella no se pueden calcular precisión ni exhaustividad (sección 14.3). Es un requisito previo a la fase 6 y conviene resolverlo pronto.
+5. ~~Instrumentación de métricas.~~ **Resuelto el 2026-09-11.** Ver 21.9.
+6. ~~Etiqueta de verdad (ground truth).~~ **Resuelto el 2026-09-11.** Ver 21.9.
 
 ## 21.6 Cuestiones técnicas detectadas que afectan al diseño
 
@@ -1299,7 +1517,7 @@ Estas observaciones son material directo para la memoria (secciones 7 y 17) y co
 - **El detector lee su histórico de `bronze`, que lo escribe otro job.** El escritor dispara cada 10 s y el detector cada 15 s, así que la media y la desviación con las que se juzga una transacción dependen de una tabla que puede ir por detrás o por delante. En particular, la propia transacción que se está evaluando puede haber sido ya escrita en `bronze`, contaminando su propia media. Es un acoplamiento entre jobs que habrá que medir y justificar, o sustituir por estado en el propio stream (`flatMapGroupsWithState`) o por una ventana deslizante de Structured Streaming.
 - **El cálculo del histórico hace un `ROW_NUMBER()` sobre toda la tabla `bronze` en cada micro-lote.** El coste crece con el histórico acumulado, no con el tamaño del lote. Es previsible que sea el primer cuello de botella al subir la carga, y por eso mismo es un buen objeto de estudio experimental.
 - **`estado_cuenta` guarda solo la última transacción de cada cuenta.** Es intencionado (patrón account shadow, maximiza los `UPDATE` para el CDC), pero implica que Postgres no conserva el histórico y que el recuento de "eventos generados" para las métricas de integridad tiene que salir del generador, no de la base de datos.
-- **Los ficheros `README.md` y `debezium/README.md` describen todavía el caso de uso IoT anterior** (sensores, tabla `estado_dispositivo`, script `generate_devices.py`, conector `iot-connector`, tópico `iot.public.estado_dispositivo`). Los nombres reales son `estado_cuenta`, `generate_transactions.py`, `fraude-connector` y `fraude.public.estado_cuenta`. **No seguir las instrucciones de esos README tal cual: no funcionan.** Deben reescribirse, y hasta entonces la fuente fiable es este `CLAUDE.md` y el código.
+- ~~Los README describen el caso de uso IoT anterior.~~ **Resuelto el 2026-09-11:** ambos reescritos y sus procedimientos verificados contra el entorno real. Ver la sección 7.
 
 ## 21.7 Historia del proyecto: cambio de dominio
 
@@ -1310,3 +1528,44 @@ Quedan restos de esa etapa anterior en el nombre de la base de datos (`iot`), en
 ## 21.8 Archivos ajenos al proyecto
 
 `spark-scripts/Recordatorio.pdf` es un documento personal sin relación con el TFG que acabó en el repositorio por error (está sin seguimiento en git). No debe añadirse a ningún commit; lo razonable es moverlo fuera del repositorio. Antes de preparar el repositorio público (fase 11) conviene revisar que no queden más archivos de este tipo.
+
+## 21.9 Cambios del 2026-09-11
+
+Tres checkpoints, cada uno con su commit y verificado contra el entorno levantado.
+
+**Documentación (`8e0ff19`).** `README.md` y `debezium/README.md` reescritos para el caso de uso de fraude bancario. El procedimiento de registro del conector se ejecutó de principio a fin: `201 Created` y estado `RUNNING`.
+
+**Etiqueta de verdad (`8c04139`).** `estado_cuenta` incorpora dos columnas nuevas:
+
+| Columna | Tipo | Valores |
+|---|---|---|
+| `es_anomalia_generada` | `BOOLEAN NOT NULL DEFAULT false` | si el generador la inyectó como anómala |
+| `tipo_anomalia_generada` | `VARCHAR(30)` | `NULL`, `importe`, `importe_ubicacion` |
+
+La etiqueta atraviesa todo el pipeline hasta `silver`, donde queda junto a la predicción del detector (`es_anomalia`), de modo que la matriz de confusión sale de una sola consulta. **Regla de diseño que no se puede romper:** ninguna lógica de detección lee esas columnas. El z-score se calcula solo con el importe y el histórico de la cuenta. Si el detector mirase la etiqueta, el experimento dejaría de medir nada.
+
+Los dos jobs que escriben en Iceberg incluyen una función `asegurar_columnas` que añade a una tabla ya existente las columnas que le falten, porque `CREATE TABLE IF NOT EXISTS` no evoluciona el esquema de una tabla anterior. Se apoya en la evolución de esquema de Iceberg, que no reescribe los datos: las filas antiguas devuelven `NULL` en la columna nueva. Es, además, una demostración práctica de una de las capacidades por las que se eligió Iceberg, y como tal sirve para la memoria.
+
+**Instrumentación de métricas (`ebab1af`).** Dos piezas nuevas:
+
+- `spark-scripts/metricas.py`: un `StreamingQueryListener` registrado en los dos jobs de streaming. Escribe una fila por micro-lote en `warehouse/_metricas/<job>_<marca>.csv` con filas de entrada, throughput, duración del micro-lote, duración de la escritura y consumer lag, y vuelca el progreso íntegro de Spark en un `.jsonl` paralelo por si más adelante hace falta una métrica que hoy no está entre las columnas elegidas.
+- `scripts/recolectar_recursos.py`: muestrea `docker stats` desde el anfitrión y registra CPU y memoria por contenedor, que es lo que el listener no puede ver desde dentro.
+
+**Detalle técnico importante para la evaluación:** el consumer lag se toma de `maxOffsetsBehindLatest`, que publica la propia fuente de Kafka en el evento de progreso. Es la vía correcta porque **Spark Structured Streaming no confirma offsets contra Kafka**: usa su propio checkpoint. Por eso `kafka-consumer-groups.sh --describe` no ve estos consumidores y no sirve para medir su lag, que es el camino que uno esperaría a primera vista.
+
+### Parámetros y rutas que esto añade
+
+| Elemento | Valor por defecto | Dónde |
+|---|---|---|
+| `RUTA_METRICAS` | `/home/iceberg/warehouse/_metricas` | variable de entorno leída por `metricas.py` |
+| `--intervalo` | 5 s | `recolectar_recursos.py` |
+| `--duracion` | 0 (hasta `Ctrl+C`) | `recolectar_recursos.py` |
+| `--etiqueta` | `recursos` | prefijo del CSV, útil para nombrar cada experimento |
+
+Las métricas caen en `warehouse/_metricas/`, dentro de un directorio ya excluido del control de versiones, así que las medidas de un mismo experimento quedan juntas y no se versionan por accidente.
+
+### Decisiones pendientes que dejó esta sesión
+
+1. **Añadir `__pycache__/` a `.gitignore`.** Dos ficheros `.pyc` se colaron en un commit y hubo que sacarlos (`2cec394`). Volverán a colarse en el próximo `git add -A`. Modificar `.gitignore` requiere confirmación explícita según la sección 11.
+2. **Eliminar el replication slot huérfano `iot_slot`** (sección 7).
+3. **Dar volumen persistente a MinIO** (sección 7).
