@@ -327,25 +327,35 @@ FROM demo.bronze.eventos_cuenta;"
 ## 7. Parar el entorno
 
 ```bash
-docker compose down       # para los contenedores y conserva el volumen de Postgres
+docker compose down       # para los contenedores y conserva los volúmenes
 ```
 
-> **No ejecutes `docker compose down -v`** salvo que quieras borrar también el
-> volumen de Postgres.
+### Qué sobrevive a un `docker compose down` y qué no
 
-> **El lakehouse no sobrevive a un `docker compose down`**, ni siquiera sin `-v`.
-> El catálogo Iceberg guarda su índice de tablas en un SQLite dentro del
-> contenedor `tfg-iceberg-rest`, que no tiene ningún volumen, y MinIO usa un
-> volumen anónimo que Docker no reasigna al recrear el contenedor. Los
-> checkpoints de Spark, en cambio, sí persisten en `warehouse/_checkpoints`, así
-> que al volver a levantar el entorno los jobs reanudan desde los offsets
-> guardados y **no reprocesan** los eventos anteriores: las tablas se recrean
-> vacías y esos eventos se pierden sin ningún aviso.
->
-> Mientras esto no se resuelva, usa **`docker compose stop`** en lugar de `down`
-> para conservar los datos entre sesiones. Si necesitas empezar de cero a
-> propósito, borra también `warehouse/_checkpoints` para que los jobs vuelvan a
-> leer el topic desde el principio.
+| Dato | ¿Sobrevive? | Dónde vive |
+|---|---|---|
+| Tablas Iceberg de `bronze` y `silver` | Sí | volumen `miniodata` |
+| Índice de tablas del catálogo | Sí | volumen `icebergcatalog` |
+| Base de datos PostgreSQL | Sí | volumen `pgdata` |
+| Checkpoints y métricas de Spark | Sí | `warehouse/` del repositorio |
+| Eventos del topic de Kafka | **No** | volumen anónimo, se pierde |
+| Registro del conector de Debezium | **No** | topic `connect_configs` de Kafka |
+
+Es decir: **los resultados persisten, el flujo de eventos no**. Tras un
+`docker compose down` hay que **volver a registrar el conector** (paso 2), pero
+las tablas y sus datos siguen ahí.
+
+Esa asimetría es deliberada y está justificada en `CLAUDE.md`: los resultados de
+un experimento tienen que poder consultarse después, mientras que arrancar cada
+experimento con un Kafka limpio evita que los eventos de la ejecución anterior
+contaminen las medidas de throughput y de consumer lag.
+
+> **No ejecutes `docker compose down -v`** salvo que quieras borrar también los
+> volúmenes, es decir, la base de datos y el lakehouse completo.
+
+> Si quieres reprocesar desde cero los eventos que ya están en Kafka, borra
+> además `warehouse/_checkpoints`: sin eso, los jobs de Spark reanudan desde los
+> offsets guardados y no vuelven a leer el topic desde el principio.
 
 ## Estructura del repositorio
 

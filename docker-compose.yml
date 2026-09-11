@@ -97,6 +97,15 @@ services:
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
+      # El catalogo guarda en este SQLite el indice que traduce el nombre de
+      # cada tabla a la ruta de sus metadatos en MinIO. Por defecto la imagen
+      # lo deja en /tmp, dentro del contenedor, asi que un "compose down" lo
+      # borraba: los datos seguian en MinIO pero dejaban de ser alcanzables
+      # como tabla. Se mueve a /home/iceberg, que es el directorio del usuario
+      # con el que corre el proceso, y se persiste en un volumen.
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/iceberg_catalog.db
+    volumes:
+      - icebergcatalog:/home/iceberg
 
   minio:
     image: minio/minio
@@ -113,6 +122,12 @@ services:
     ports:
       - "9001:9001"   # consola web de MinIO
       - "9000:9000"
+    # La imagen declara VOLUME /data, asi que sin esta linea Docker crea un
+    # volumen anonimo distinto cada vez que se recrea el contenedor y los
+    # datos anteriores quedan varados en un volumen colgante. Con un volumen
+    # con nombre, el lakehouse sobrevive a "docker compose down".
+    volumes:
+      - miniodata:/data
     command: ["server", "/data", "--console-address", ":9001"]
 
   # Contenedor auxiliar que solo crea el bucket "warehouse" al arrancar y
@@ -134,4 +149,6 @@ services:
       "
 
 volumes:
-  pgdata:
+  pgdata:          # datos de PostgreSQL
+  miniodata:       # objetos del lakehouse (ficheros de datos y metadatos Iceberg)
+  icebergcatalog:  # indice de tablas del catalogo Iceberg (SQLite)

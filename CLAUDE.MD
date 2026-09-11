@@ -562,6 +562,13 @@ Si durante el desarrollo se propone añadir una funcionalidad fuera de este alca
 - No introducir servicios de pago salvo autorización explícita del usuario.
 - La arquitectura debe poder ejecutarse en una única máquina de desarrollo.
 
+## 2026-09-11 — Persistencia del lakehouse mediante volúmenes con nombre
+
+- **Elegido:** declarar volúmenes con nombre para MinIO y para el catálogo Iceberg en `docker-compose.yml`.
+- **Alternativas:** catálogo respaldado por PostgreSQL; o no tocar nada y usar siempre `docker compose stop`.
+- **Motivo:** era la opción que resolvía el problema por completo con el menor incremento de complejidad. El análisis detallado, con la tabla comparativa de las tres alternativas y el motivo de cada descarte, está en la sección 7.
+- **Impacto:** el lakehouse sobrevive a `docker compose down`, lo que era requisito para poder defender los resultados experimentales de la fase 10.
+
 ## 2026-09-11 — Cambio de decisión: una sola rama de trabajo
 
 - **Decisión anterior:** dos ramas, `main` estable y `tfg` de desarrollo, con la instrucción de no trabajar nunca directamente sobre `main`.
@@ -640,8 +647,26 @@ Los problemas técnicos relevantes son información útil para la memoria del TF
   - **MinIO sí tiene volumen, pero anónimo.** La imagen `minio/minio` declara `VOLUME /data` en su Dockerfile, así que Docker le crea un volumen anónimo con nombre aleatorio (verificado: `2ade2b47…`, con 2,3 MB de datos). Sobrevive a `restart` y a `stop`/`start`. Lo que no sobrevive es un `docker compose down`: el contenedor se elimina y el siguiente `up` crea uno nuevo con un volumen anónimo **nuevo y vacío**. Los datos no se borran, quedan varados en un volumen colgante — recuperables a mano, pero en la práctica perdidos, y acumulando basura en disco. Un `docker volume prune` sí los borra de verdad.
   - **El catálogo Iceberg no tiene ningún volumen.** `tfg-iceberg-rest` arranca con `CATALOG_URI=jdbc:sqlite:/tmp/iceberg_catalog.db`, un fichero SQLite dentro de la capa de escritura del contenedor (verificado: su lista de montajes está vacía). Ese fichero es el que traduce `demo.bronze.eventos_cuenta` a la ruta de sus ficheros de metadatos. Si desaparece, los datos siguen en MinIO pero dejan de ser alcanzables como tabla.
 - **La trampa, que es lo peor del asunto:** los checkpoints de Spark **sí** persisten, porque viven en `/home/iceberg/warehouse/_checkpoints`, que es un *bind mount* a `./warehouse` del repositorio (verificado: 227 kB en el anfitrión). Tras un `down` + `up` queda un estado incoherente: el catálogo está vacío y las tablas ya no existen, pero Spark reanuda desde los offsets de Kafka que ya tenía guardados y **no vuelve a procesar esos eventos**. Las tablas se recrean vacías y pierden para siempre todo lo anterior, sin ningún error visible.
-- **Estado:** **sin resolver, pendiente de decisión del usuario**, porque la solución modifica el `docker-compose.yml`.
-- **Impacto en el TFG:** afecta directamente a la reproducibilidad de la fase 10. Un resultado experimental que no se puede volver a consultar tras reiniciar el entorno es difícil de defender, y un pipeline que pierde eventos en silencio contamina las métricas de integridad de la sección 14.3.
+- **Alternativas consideradas:**
+
+  | Opción | En qué consiste | Ventajas | Inconvenientes |
+  |---|---|---|---|
+  | **A. Volúmenes con nombre** | Declarar en `docker-compose.yml` un volumen para `/data` de MinIO y otro para el fichero del catálogo | Cambio mínimo, reversible, sin servicios nuevos; deja explícito en el compose qué datos son duraderos | No convierte el catálogo en uno "de producción": sigue siendo un SQLite |
+  | **B. Catálogo sobre PostgreSQL** | Sustituir el SQLite por una base de datos en el `tfg-postgres` existente | Más robusto y más parecido a un despliegue real; un único motor que respaldar | Más configuración; acopla el catálogo a la base de datos que además hace de origen del caso de uso, lo que enturbia el papel de cada componente en la arquitectura |
+  | **C. No tocar nada** | Usar siempre `docker compose stop` en lugar de `down` | Coste cero | Depende de no equivocarse nunca; un `down` accidental destruye un experimento en curso sin avisar |
+
+- **Solución elegida: la A**, aplicada el 2026-09-11 con la aprobación del usuario. El criterio fue el de la sección 20: resuelve el problema por completo con el menor incremento de complejidad, sin añadir servicios ni dependencias. La B se descartó porque su ventaja real —robustez del motor de catálogo— no aporta nada a la pregunta de investigación, que va sobre rendimiento, y sí añadía acoplamiento entre dos componentes que en la arquitectura cumplen papeles distintos. La C se descartó porque convierte un problema técnico en una regla que hay que recordar, y las reglas que hay que recordar se incumplen.
+- **Cómo se aplicó:** volúmenes `miniodata` (montado en `/data`) e `icebergcatalog` (montado en `/home/iceberg`), más `CATALOG_URI: jdbc:sqlite:/home/iceberg/iceberg_catalog.db`. El montaje se hizo sobre `/home/iceberg` y no sobre un subdirectorio nuevo porque ese directorio ya existe en la imagen y pertenece al usuario `iceberg` (uid 1000) con el que corre el proceso: Docker conserva esa propiedad al inicializar el volumen, mientras que un subdirectorio inexistente lo habría creado como `root` y el proceso no habría podido escribir.
+- **Resultado, verificado:** se reconstruyeron las 2.511 filas de `bronze`, se ejecutó `docker compose down` y `docker compose up -d`, y la tabla siguió ahí con las mismas 2.511 filas y 420 anomalías. Antes del cambio ese mismo `down` la habría vaciado en silencio.
+- **Impacto en el TFG:** elimina un riesgo directo sobre la reproducibilidad de la fase 10 y sobre las métricas de integridad de la sección 14.3, que un pipeline capaz de perder eventos sin avisar habría contaminado.
+
+### [2026-09-11] Kafka y el conector tampoco sobreviven a un `docker compose down`
+
+- **Síntoma:** detectado al verificar la solución del problema anterior. Tras `docker compose down` y `up -d`, el tópico `fraude.public.estado_cuenta` había desaparecido y `curl localhost:8083/connectors` devolvía `[]`: el conector ya no estaba registrado.
+- **Causa:** es el mismo mecanismo. Las imágenes de Kafka declaran `VOLUME` sobre `/kafka/data`, `/kafka/logs` y `/kafka/config`, así que Docker crea volúmenes anónimos que no se reasignan al recrear el contenedor. La configuración del conector vive en el tópico `connect_configs`, que se pierde con ellos.
+- **Consecuencia práctica:** hay que volver a registrar el conector después de cada `docker compose down`. Ya está recogido como paso del procedimiento en el `README.md` y en la sección 13.
+- **Estado:** **decisión pendiente y deliberadamente no resuelta.** No es evidente que convenga arreglarlo. Para la fase experimental puede ser incluso preferible que Kafka arranque limpio en cada experimento: un tópico con eventos de la ejecución anterior contamina las medidas de throughput y de consumer lag, y obliga a distinguir el transitorio de arranque en frío del régimen estacionario (efecto que ya se observó en la prueba del 2026-09-11, con una latencia máxima de 87 s).
+- **Criterio para decidirlo más adelante:** la asimetría deseable es **lakehouse duradero, flujo efímero**. Los resultados de un experimento deben poder consultarse después; los eventos que lo produjeron, no necesariamente. Si en algún momento hace falta reproducir un experimento a partir de los mismos eventos exactos, habrá que darle volumen con nombre a Kafka; mientras tanto, la situación actual es defendible y conviene explicarla así en la memoria en lugar de presentarla como un descuido.
 
 ---
 
@@ -1578,5 +1603,5 @@ Las métricas caen en `warehouse/_metricas/`, dentro de un directorio ya excluid
 
 1. ~~Añadir `__pycache__/` a `.gitignore`.~~ **Aprobado y aplicado** (`5047f9b`).
 2. ~~Eliminar el replication slot huérfano `iot_slot`.~~ **Aprobado y aplicado.** Ver la sección 7.
-3. **Dar persistencia al lakehouse.** Pendiente de decisión del usuario. El diagnóstico inicial era incorrecto y está corregido en la sección 7: MinIO sí tiene volumen, aunque anónimo; el que no tiene ninguno es el catálogo Iceberg, y los checkpoints de Spark sí persisten, lo que deja un estado incoherente tras un `down` + `up`.
+3. ~~Dar persistencia al lakehouse.~~ **Aprobada la opción A y aplicada.** Volúmenes con nombre para MinIO y para el catálogo Iceberg. Verificado con un `down` + `up` completo: las 2.511 filas de `bronze` siguen ahí. El análisis de alternativas y el motivo de la elección están en las secciones 6 y 7. Al verificarlo se descubrió que Kafka y el conector tienen el mismo problema, que queda documentado y sin resolver a propósito (sección 7).
 4. **Rama única `main`.** Decidido por el usuario. Los siete commits de la sesión se llevaron de `tfg` a `main` mediante un avance rápido. Ver las secciones 6 y 10.
