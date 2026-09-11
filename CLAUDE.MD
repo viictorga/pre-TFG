@@ -1201,3 +1201,112 @@ El proyecto debe avanzar de forma incremental:
 7. Probar nuevamente.
 
 No intentar construir toda la arquitectura de una sola vez.
+
+---
+
+# 21. Estado real del repositorio (auditoría de lectura, 2026-09-11)
+
+Esta sección recoge lo que **realmente existe en el repositorio** frente a lo que está planificado, para que futuras sesiones no tengan que volver a deducirlo leyendo todo el código. Es una foto del estado en la fecha indicada: debe verificarse contra el código antes de darla por buena y actualizarse cuando cambie.
+
+## 21.1 Inventario de archivos relevantes
+
+```text
+docker-compose.yml                        # 8 servicios (ver 21.2)
+sql/init.sql                              # tabla estado_cuenta (account shadow)
+generator/generate_transactions.py        # generador de transacciones bancarias
+generator/requirements.txt                # psycopg2-binary, Faker
+debezium/register-connector.json          # conector Debezium "fraude-connector"
+debezium/README.md                        # DESACTUALIZADO (habla de IoT)
+README.md                                 # DESACTUALIZADO (habla de IoT)
+spark-scripts/read_kafka_console.py       # Fase 3A: consumo CDC a consola
+spark-scripts/read_kafka_to_bronze.py     # Fase 3B: escritura en bronze (Iceberg)
+spark-scripts/detectar_anomalias.py       # Fase 3C: z-score -> silver
+documentation/propuesta_tfg_fraude_bancario.md
+notebooks/                                # vacío
+warehouse/                                # vacío en local; ignorado por git
+```
+
+`.gitignore` contiene únicamente `warehouse/` y `venv/`. **Todavía no existe ningún `.env`**: las credenciales (`tfg` / `tfg_pass`, `admin` / `password`) están escritas directamente en `docker-compose.yml` y como valores por defecto en el generador. Esto contradice la convención de la sección 9 y debe resolverse antes de publicar el repositorio.
+
+## 21.2 Servicios definidos en `docker-compose.yml`
+
+| Servicio | Contenedor | Imagen | Puertos |
+|---|---|---|---|
+| postgres | `tfg-postgres` | `postgres:16` (`wal_level=logical`) | 5432 |
+| zookeeper | `tfg-zookeeper` | `quay.io/debezium/zookeeper:2.7` | 2181 |
+| kafka | `tfg-kafka` | `quay.io/debezium/kafka:2.7` | 9092 |
+| connect | `tfg-connect` | `quay.io/debezium/connect:2.7` | 8083 |
+| spark-iceberg | `tfg-spark` | `tabulario/spark-iceberg:3.5.5_1.8.1` | 8888, 8080, 10000, 10001 |
+| rest | `tfg-iceberg-rest` | `apache/iceberg-rest-fixture` | 8181 |
+| minio | `tfg-minio` | `minio/minio` | 9000, 9001 |
+| mc | `tfg-mc` | `minio/mc` (crea el bucket `warehouse` y duerme) | — |
+
+Notas operativas importantes:
+
+- La base de datos se sigue llamando **`iot`** y el volumen **`pgdata`**, herencia del caso de uso anterior. El nombre no afecta al funcionamiento, pero conviene decidir si se renombra (implica recrear el volumen) o si se justifica en la memoria.
+- El catálogo Iceberg se llama **`demo`** y viene preconfigurado en la imagen `tabulario/spark-iceberg` apuntando al catálogo REST (`tfg-iceberg-rest`) sobre MinIO. Por eso los scripts usan `demo.bronze.*` y `demo.silver.*` sin configurar nada más.
+- Kafka es de **un solo broker y con ZooKeeper** (no KRaft). Los tópicos los crea Debezium automáticamente, por lo que por defecto tendrán **1 partición**. Para los experimentos sobre particionado de la sección 14.2 habrá que crear el tópico explícitamente con más particiones antes de arrancar el conector, o reconfigurar el conector.
+
+## 21.3 Flujo implementado hoy
+
+```text
+generate_transactions.py --UPSERT--> Postgres.estado_cuenta
+        --> Debezium (fraude-connector) --> Kafka topic fraude.public.estado_cuenta
+                 |
+                 +--> read_kafka_to_bronze.py  (trigger 10 s)  --> demo.bronze.eventos_cuenta
+                 |
+                 +--> detectar_anomalias.py    (trigger 15 s)  --> demo.silver.transacciones_validadas
+```
+
+Los dos jobs de Spark son **consumidores independientes del mismo tópico** y deben ejecutarse a la vez, cada uno con su propio `checkpointLocation` bajo `/home/iceberg/warehouse/_checkpoints/`.
+
+Comando de ejecución de cada job (dentro del contenedor, en una terminal distinta cada uno):
+
+```bash
+docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/<script>.py
+```
+
+Según los mensajes de commit, este flujo se ha llegado a ejecutar y se observaron los micro-lotes por terminal, pero **no hay ninguna medición registrada**, por lo que ninguna fase puede marcarse como completada según la regla de la sección 19.
+
+## 21.4 Parámetros ya implementados
+
+| Parámetro | Dónde | Valor por defecto |
+|---|---|---|
+| `NUM_CUENTAS` | generador | 30 |
+| `INTERVALO_SEGUNDOS` | generador | 2 |
+| `PROB_ANOMALIA` | generador | 0.04 |
+| `PROB_RECHAZO` | generador | 0.05 |
+| `VENTANA_LECTURAS` | `detectar_anomalias.py` | 20 |
+| `Z_SCORE_UMBRAL` | `detectar_anomalias.py` | 3.0 |
+
+`VENTANA_LECTURAS` y `Z_SCORE_UMBRAL` están **hardcodeados** como constantes de módulo; para poder barrerlos en la matriz de experimentos habrá que parametrizarlos por variable de entorno o argumento.
+
+## 21.5 Lo que falta respecto a la propuesta
+
+Pendiente de implementar (no existe ni una versión mínima):
+
+1. **Modo de pico de carga** en el generador (objetivo específico 1 y sección 2.4). Hoy la frecuencia es constante.
+2. **Modo de eventos corruptos** en el generador. Hoy es imposible generar un evento malformado: el `INSERT` pasa por un esquema tipado de Postgres, así que **la corrupción no puede inyectarse en el origen tal y como está montado**. Habrá que decidir dónde se inyecta (por ejemplo, un productor Kafka paralelo que escriba directamente en el tópico, o campos de texto libre en la tabla). Es una decisión de diseño abierta y debe consultarse con el usuario.
+3. **Dead-letter queue.** No existe. Los scripts actuales hacen `filter(col("id_cuenta").isNotNull())`, es decir, **descartan silenciosamente** lo que no encaja en el esquema en vez de aislarlo y contabilizarlo. Descartar no es lo mismo que aislar: la DLQ debe conservar el evento y su motivo de fallo.
+4. **Capa gold**, **dbt Core**, **Airflow**, **DuckDB** y **dashboard**. Ninguno está en `docker-compose.yml`.
+5. **Instrumentación de métricas.** No hay nada que mida throughput, latencia, consumer lag, CPU ni RAM. La pregunta de investigación depende de esto, así que decidir cómo se recogen las métricas (por ejemplo, `kafka-consumer-groups.sh`, el `StreamingQueryListener` de Spark, `docker stats`, o Prometheus + Grafana) es la decisión pendiente más urgente después del diseño.
+6. **Etiqueta de verdad (ground truth).** El generador sabe qué transacciones marcó como anómalas, pero **no persiste esa etiqueta en ningún sitio**: la columna no existe en `estado_cuenta`. Sin ella no se pueden calcular precisión ni exhaustividad (sección 14.3). Es un requisito previo a la fase 6 y conviene resolverlo pronto.
+
+## 21.6 Cuestiones técnicas detectadas que afectan al diseño
+
+Estas observaciones son material directo para la memoria (secciones 7 y 17) y conviene contrastarlas experimentalmente antes de darlas por ciertas:
+
+- **El detector lee su histórico de `bronze`, que lo escribe otro job.** El escritor dispara cada 10 s y el detector cada 15 s, así que la media y la desviación con las que se juzga una transacción dependen de una tabla que puede ir por detrás o por delante. En particular, la propia transacción que se está evaluando puede haber sido ya escrita en `bronze`, contaminando su propia media. Es un acoplamiento entre jobs que habrá que medir y justificar, o sustituir por estado en el propio stream (`flatMapGroupsWithState`) o por una ventana deslizante de Structured Streaming.
+- **El cálculo del histórico hace un `ROW_NUMBER()` sobre toda la tabla `bronze` en cada micro-lote.** El coste crece con el histórico acumulado, no con el tamaño del lote. Es previsible que sea el primer cuello de botella al subir la carga, y por eso mismo es un buen objeto de estudio experimental.
+- **`estado_cuenta` guarda solo la última transacción de cada cuenta.** Es intencionado (patrón account shadow, maximiza los `UPDATE` para el CDC), pero implica que Postgres no conserva el histórico y que el recuento de "eventos generados" para las métricas de integridad tiene que salir del generador, no de la base de datos.
+- **Los ficheros `README.md` y `debezium/README.md` describen todavía el caso de uso IoT anterior** (sensores, tabla `estado_dispositivo`, script `generate_devices.py`, conector `iot-connector`, tópico `iot.public.estado_dispositivo`). Los nombres reales son `estado_cuenta`, `generate_transactions.py`, `fraude-connector` y `fraude.public.estado_cuenta`. **No seguir las instrucciones de esos README tal cual: no funcionan.** Deben reescribirse, y hasta entonces la fuente fiable es este `CLAUDE.md` y el código.
+
+## 21.7 Historia del proyecto: cambio de dominio
+
+El repositorio nació con un caso de uso de **sensores IoT** (tabla `estado_dispositivo`, patrón *device shadow*, ~30 sensores de temperatura y humedad) y se reconvirtió a **detección de fraude en transacciones bancarias** en el commit `af4c05a`. La conversión se hizo sobre el mismo esqueleto: el patrón *account shadow* es el antiguo *device shadow* y la lógica de detección por z-score es la misma que se aplicaba a las lecturas de los sensores.
+
+Quedan restos de esa etapa anterior en el nombre de la base de datos (`iot`), en los dos README y en algún comentario del código. **No son errores que haya que ocultar**: documentan una decisión de diseño real y su motivo (el dominio cambió, la plataforma no tuvo que cambiar), lo cual respalda directamente la tesis de la sección 1.1 de que la plataforma es el protagonista y el dominio es intercambiable. Conviene contarlo así en la memoria en lugar de borrar el rastro.
+
+## 21.8 Archivos ajenos al proyecto
+
+`spark-scripts/Recordatorio.pdf` es un documento personal sin relación con el TFG que acabó en el repositorio por error (está sin seguimiento en git). No debe añadirse a ningún commit; lo razonable es moverlo fuera del repositorio. Antes de preparar el repositorio público (fase 11) conviene revisar que no queden más archivos de este tipo.
