@@ -14,12 +14,16 @@ Ejecutar dentro del contenedor spark-iceberg (todo en una sola linea):
     docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/read_kafka_to_bronze.py
 """
 
+from metricas import RegistradorDeMetricas
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, BooleanType
 
 spark = SparkSession.builder.appName("EscribirBronze").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
+
+# Registra una fila de metricas por micro-lote (ver metricas.py).
+spark.streams.addListener(RegistradorDeMetricas("bronze"))
 
 spark.sql("CREATE NAMESPACE IF NOT EXISTS demo.bronze")
 spark.sql("""

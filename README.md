@@ -241,7 +241,90 @@ GROUP BY tipo_anomalia_generada;"
 La consola web de MinIO está en <http://localhost:9001> (`admin` / `password`) y
 la interfaz de Spark en <http://localhost:8080>.
 
-## 6. Parar el entorno
+## 6. Medir el rendimiento
+
+La pregunta de investigación del TFG es cómo afectan la carga y la
+configuración al rendimiento de la plataforma, así que los dos jobs de
+streaming van instrumentados. Todas las medidas se escriben en
+`warehouse/_metricas/`, que está fuera del control de versiones.
+
+### Métricas del procesamiento
+
+`spark-scripts/metricas.py` engancha un `StreamingQueryListener` a los jobs:
+Spark ya calcula estas métricas internamente, el listener solo las escucha y
+las deja por escrito, sin tocar la lógica del pipeline. No hay que hacer nada
+para activarlo, ya viene registrado en los dos jobs.
+
+Por cada micro-lote se escriben dos ficheros:
+
+| Fichero | Contenido |
+|---|---|
+| `<job>_<marca>.csv` | Columnas planas listas para analizar |
+| `<job>_<marca>.jsonl` | El progreso completo tal cual lo publica Spark |
+
+El JSONL se guarda porque el CSV fija hoy unas columnas concretas, y así una
+métrica que ahora no se está mirando no obliga a repetir el experimento
+entero. Columnas del CSV:
+
+| Columna | Qué mide |
+|---|---|
+| `filas_entrada` | Eventos procesados en el micro-lote |
+| `filas_por_segundo_entrada` | Ritmo al que llegan los eventos |
+| `filas_por_segundo_procesadas` | **Throughput** del job |
+| `duracion_total_ms` | Cuánto tardó el micro-lote entero |
+| `duracion_escritura_ms` | Cuánto se fue en escribir en Iceberg |
+| `lag_maximo` / `lag_medio` | **Consumer lag**: eventos ya en Kafka que el job aún no ha leído |
+
+El `lag` es la señal clave en las pruebas de pico de carga: mientras se
+mantenga cerca de cero, el job va al día; si empieza a crecer, el
+procesamiento se está quedando por detrás de la ingesta.
+
+### Consumo de CPU y memoria
+
+El listener no puede ver desde dentro lo que cuesta cada servicio. Eso lo
+muestrea `scripts/recolectar_recursos.py`, que corre en el anfitrión (necesita
+el CLI de Docker) y lanza `docker stats` periódicamente:
+
+```bash
+python scripts/recolectar_recursos.py --intervalo 5 --duracion 300 --etiqueta pico_carga
+```
+
+Con `--duracion 0` muestrea hasta `Ctrl+C`. La etiqueta da nombre al fichero,
+lo que resulta cómodo para identificar cada experimento.
+
+> `docker stats` también consume CPU. Por debajo de uno o dos segundos de
+> intervalo la propia medición empieza a contaminar lo medido; 5 segundos es un
+> compromiso razonable para experimentos de varios minutos.
+
+### Latencia de extremo a extremo
+
+La capa `bronze` guarda el instante en que el generador escribió en Postgres
+(`fecha_actualizacion`) y el instante en que Spark persistió el evento
+(`fecha_ingesta`), así que la latencia del pipeline completo sale de una
+consulta:
+
+```bash
+docker exec -it tfg-spark spark-sql -e "
+SELECT
+  round(avg(unix_timestamp(fecha_ingesta) - unix_timestamp(to_timestamp(fecha_actualizacion))), 2) AS latencia_media_s,
+  round(max(unix_timestamp(fecha_ingesta) - unix_timestamp(to_timestamp(fecha_actualizacion))), 2) AS latencia_maxima_s,
+  count(*) AS eventos
+FROM demo.bronze.eventos_cuenta;"
+```
+
+> Esa latencia incluye el tiempo de espera del *trigger* del job, que hoy es de
+> 10 segundos en `bronze`: un evento que llega justo después de un micro-lote
+> espera hasta el siguiente. Es decir, el grueso de la latencia medida es una
+> decisión de configuración, no un límite del sistema — y precisamente por eso
+> el tamaño del trigger es uno de los parámetros interesantes que barrer en los
+> experimentos.
+
+> `fecha_actualizacion` la pone el generador (que corre en el anfitrión) y
+> `fecha_ingesta` la pone Spark (dentro de un contenedor). Si los relojes del
+> anfitrión y de los contenedores se desincronizan, la latencia medida se
+> desplaza. Conviene comprobarlo antes de dar por buenos los números.
+
+## 7. Parar el entorno
 
 ```bash
 docker compose down       # para los contenedores y conserva el volumen de Postgres
@@ -261,9 +344,10 @@ docker-compose.yml            # los 8 servicios de la plataforma
 sql/init.sql                  # esquema de la tabla estado_cuenta
 generator/                    # generador de transacciones sintéticas
 debezium/                     # configuración del conector CDC
-spark-scripts/                # jobs de Spark Structured Streaming
+spark-scripts/                # jobs de Spark Structured Streaming + instrumentación
+scripts/                      # utilidades que corren en el anfitrión
 documentation/                # propuesta del TFG
-warehouse/                    # datos locales de Iceberg (ignorado por git)
+warehouse/                    # datos de Iceberg y métricas (ignorado por git)
 ```
 
 `CLAUDE.md` contiene la memoria completa del proyecto: objetivos, decisiones
@@ -275,7 +359,8 @@ Funcionando: generador, CDC con Debezium, ingesta en Kafka, escritura en la capa
 `bronze` y detección de anomalías por z-score hacia `silver`.
 
 La etiqueta de verdad ya permite calcular precisión y exhaustividad de la
-detección sobre la capa `silver`.
+detección sobre la capa `silver`, y los jobs están instrumentados para medir
+throughput, latencia, consumer lag y consumo de recursos.
 
 Pendiente: modos de pico de carga y de eventos corruptos en el generador, cola
 de eventos fallidos (DLQ), capa `gold`, transformaciones con dbt, orquestación

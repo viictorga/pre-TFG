@@ -26,6 +26,7 @@ una tercera terminal):
     docker exec -it tfg-spark spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5 /home/iceberg/scripts/detectar_anomalias.py
 """
 
+from metricas import RegistradorDeMetricas
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
 
@@ -34,6 +35,9 @@ Z_SCORE_UMBRAL = 3.0    # a partir de cuantas desviaciones se considera anomalia
 
 spark = SparkSession.builder.appName("DetectarFraude").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
+
+# Registra una fila de metricas por micro-lote (ver metricas.py).
+spark.streams.addListener(RegistradorDeMetricas("deteccion"))
 
 spark.sql("CREATE NAMESPACE IF NOT EXISTS demo.silver")
 spark.sql("""
