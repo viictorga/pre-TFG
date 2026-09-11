@@ -484,6 +484,10 @@ warehouse/                    # datos de Iceberg y métricas (ignorado por git)
 `CLAUDE.md` contiene la memoria completa del proyecto: objetivos, decisiones
 tomadas y su justificación, plan por fases y estado real del código.
 
+`TAREAS.md` recoge el estado de las 90 tareas del plan.
+`documentation/TECNOLOGIAS.md` explica qué hace cada tecnología del stack y cómo
+encajan entre sí, siguiendo el recorrido de una transacción de principio a fin.
+
 ## Estado del proyecto
 
 Funcionando: generador, CDC con Debezium, ingesta en Kafka, escritura en la capa
