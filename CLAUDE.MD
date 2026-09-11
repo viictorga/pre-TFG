@@ -562,6 +562,15 @@ Si durante el desarrollo se propone añadir una funcionalidad fuera de este alca
 - No introducir servicios de pago salvo autorización explícita del usuario.
 - La arquitectura debe poder ejecutarse en una única máquina de desarrollo.
 
+## 2026-09-11 — Kafka efímero entre experimentos
+
+- **Elegido:** no dar persistencia a Kafka. Arranca vacío tras cada `docker compose down`.
+- **Alternativa:** darle volúmenes con nombre, igual que a MinIO y al catálogo.
+- **Motivo:** los eventos de una ejecución anterior contaminan las métricas de la siguiente (consumer lag inicial distinto de cero, throughput del primer micro-lote midiendo el vaciado de un backlog). Un Kafka vacío hace los experimentos comparables entre sí.
+- **Principio que establece:** lakehouse duradero, flujo efímero.
+- **Impacto:** hay que volver a registrar el conector de Debezium tras cada `down`.
+- **Impacto sobre la memoria:** es una decisión metodológica sobre el diseño experimental, no un detalle de infraestructura, y como tal debería aparecer en el capítulo de evaluación.
+
 ## 2026-09-11 — Persistencia del lakehouse mediante volúmenes con nombre
 
 - **Elegido:** declarar volúmenes con nombre para MinIO y para el catálogo Iceberg en `docker-compose.yml`.
@@ -665,8 +674,11 @@ Los problemas técnicos relevantes son información útil para la memoria del TF
 - **Síntoma:** detectado al verificar la solución del problema anterior. Tras `docker compose down` y `up -d`, el tópico `fraude.public.estado_cuenta` había desaparecido y `curl localhost:8083/connectors` devolvía `[]`: el conector ya no estaba registrado.
 - **Causa:** es el mismo mecanismo. Las imágenes de Kafka declaran `VOLUME` sobre `/kafka/data`, `/kafka/logs` y `/kafka/config`, así que Docker crea volúmenes anónimos que no se reasignan al recrear el contenedor. La configuración del conector vive en el tópico `connect_configs`, que se pierde con ellos.
 - **Consecuencia práctica:** hay que volver a registrar el conector después de cada `docker compose down`. Ya está recogido como paso del procedimiento en el `README.md` y en la sección 13.
-- **Estado:** **decisión pendiente y deliberadamente no resuelta.** No es evidente que convenga arreglarlo. Para la fase experimental puede ser incluso preferible que Kafka arranque limpio en cada experimento: un tópico con eventos de la ejecución anterior contamina las medidas de throughput y de consumer lag, y obliga a distinguir el transitorio de arranque en frío del régimen estacionario (efecto que ya se observó en la prueba del 2026-09-11, con una latencia máxima de 87 s).
-- **Criterio para decidirlo más adelante:** la asimetría deseable es **lakehouse duradero, flujo efímero**. Los resultados de un experimento deben poder consultarse después; los eventos que lo produjeron, no necesariamente. Si en algún momento hace falta reproducir un experimento a partir de los mismos eventos exactos, habrá que darle volumen con nombre a Kafka; mientras tanto, la situación actual es defendible y conviene explicarla así en la memoria en lugar de presentarla como un descuido.
+- **Resolución: se deja así a propósito.** Decisión explícita del usuario del 2026-09-11: Kafka debe arrancar limpio en cada experimento. No se le añaden volúmenes con nombre.
+- **Motivo:** un tópico que conserva los eventos de la ejecución anterior contamina las medidas. El consumer lag arranca distinto de cero, el throughput del primer micro-lote mide el vaciado de un backlog en vez del régimen normal, y hay que separar el transitorio de arranque en frío del estado estacionario. Ese efecto ya se observó en la prueba del 2026-09-11: latencia máxima de 87 s frente a una media de 10,89 s, debida exclusivamente al backlog acumulado. Partir de un Kafka vacío elimina esa fuente de ruido y hace los experimentos comparables entre sí.
+- **Principio de diseño que esto establece: lakehouse duradero, flujo efímero.** Los resultados de un experimento tienen que poder consultarse después; los eventos que lo produjeron, no. Es una asimetría deliberada y conviene presentarla así en la memoria, como decisión razonada, en lugar de como un descuido de configuración.
+- **Consecuencia operativa:** tras cada `docker compose down` hay que volver a registrar el conector de Debezium, porque su configuración vive en el tópico `connect_configs`. Está recogido como paso del procedimiento en el `README.md` y en la sección 13.
+- **Cuándo habría que reconsiderarlo:** si en algún momento hiciera falta reproducir un experimento a partir de exactamente los mismos eventos, en lugar de regenerarlos. En ese caso habría que dar volumen con nombre a Kafka y asumir el ruido que introduce.
 
 ---
 
