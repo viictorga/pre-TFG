@@ -336,3 +336,83 @@ obliga a que el histórico completo viva en la capa `bronze`.
 | **Airflow** | Ejecuta y supervisa esas transformaciones periódicamente. | Habría que lanzarlas a mano. |
 | **DuckDB** | Motor analítico embebido para consultar el lakehouse. | Haría falta un motor pesado como Trino. |
 | **Metabase / Streamlit** | La capa visual sobre los datos. | Los resultados solo se verían por consola. |
+
+---
+
+## 7. Glosario
+
+Términos que aparecen constantemente en este proyecto y cuyo significado no
+siempre es evidente. Están agrupados por la pieza a la que pertenecen.
+
+### Kafka
+
+| Término | Qué es |
+|---|---|
+| **Broker** | Un servidor de Kafka. Este proyecto tiene uno solo (`tfg-kafka`); un clúster real tendría varios. |
+| **Topic** | El nombre bajo el que se agrupan eventos del mismo tipo. Aquí, `fraude.public.estado_cuenta`. |
+| **Partición** | Cada trozo en que se divide un topic. Es la unidad real de orden y de paralelismo: el orden solo está garantizado dentro de una partición. |
+| **Offset** | El número de orden de un evento dentro de su partición. Nunca se reutiliza y siempre crece. Es la «página» por la que va cada lector. |
+| **Clave (*key*)** | Valor que decide en qué partición cae un evento. Debezium usa la clave primaria, así que todos los eventos de una cuenta van juntos y en orden. |
+| **Factor de réplica** | Cuántas copias de cada partición se guardan en brókers distintos. Aquí es 1: no hay tolerancia a fallos, y es una limitación asumida. |
+| **Retención** | Cuánto tiempo conserva Kafka un evento **aunque ya se haya leído**. Aquí, 168 horas (7 días). |
+| **Segmento** | Cada fichero en que se parte físicamente una partición en disco (`.log`, más índices). |
+| **Consumer group** | Conjunto de consumidores que se reparten las particiones de un topic. Dentro de un grupo, cada partición la lee solo uno. |
+| **Consumer lag** | Eventos que ya están en el topic y el consumidor todavía no ha leído. La medida directa de si el procesamiento va por detrás de la ingesta. |
+| **Backpressure** | Mecanismo por el que un consumidor lento hace que el sistema se frene o acumule, en vez de perder datos. |
+
+### Spark Structured Streaming
+
+| Término | Qué es |
+|---|---|
+| **Driver** | El proceso que planifica el trabajo y coordina a los ejecutores. Aquí corre todo en el mismo contenedor. |
+| **Executor** | El proceso que ejecuta de verdad las tareas sobre los datos. |
+| **DataFrame** | Una tabla distribuida con esquema. Es la abstracción con la que se escribe casi todo en Spark. |
+| **Micro-lote** | El grupo de eventos que Spark procesa de una vez. Structured Streaming no procesa evento a evento, sino por micro-lotes. |
+| **Trigger** | Cada cuánto se dispara un micro-lote. Fija la latencia mínima del pipeline: un evento que llega recién cerrado un lote espera al siguiente. |
+| **`maxOffsetsPerTrigger`** | Tope de eventos que entran en cada micro-lote. Sin él, Spark consume todo lo disponible y el consumer lag vale cero por construcción. |
+| **Checkpoint** | Directorio donde Spark anota qué offsets ha procesado y con qué estado. Es lo que le permite reanudar exactamente donde lo dejó. |
+| **`foreachBatch`** | Punto de extensión que entrega cada micro-lote como un DataFrame normal, para poder ejecutar sobre él código arbitrario. |
+| **Evaluación perezosa** | Spark no ejecuta nada hasta que se le pide un resultado; hasta entonces solo construye el plan. Explica que un error aparezca mucho después de la línea que lo causó. |
+| **Idempotencia** | Propiedad de una operación que, repetida, deja el mismo resultado. Es lo que permite reintentar un micro-lote sin duplicar datos. |
+
+### Iceberg y almacenamiento
+
+| Término | Qué es |
+|---|---|
+| **Formato de tabla** | Capa de metadatos que convierte un conjunto de ficheros sueltos en una tabla con transacciones, esquema e historial. Iceberg, Delta Lake y Hudi son los tres principales. |
+| **Parquet** | Formato de fichero **columnar**: guarda juntos los valores de una misma columna. Comprime mucho mejor y permite leer solo las columnas necesarias. |
+| **Columnar** | Organizar los datos por columnas en vez de por filas. Ideal para analítica, que suele leer pocas columnas de muchas filas. |
+| **Instantánea (*snapshot*)** | El conjunto exacto de ficheros que componían la tabla en un momento dado. Cada escritura crea una nueva. |
+| **Manifiesto (*manifest*)** | Fichero de metadatos que lista ficheros de datos con sus estadísticas (mínimos, máximos, número de filas). |
+| **Commit atómico** | Publicar una instantánea cambiando de golpe un único puntero. O se ve entera o no se ve: nunca a medias. |
+| **Evolución de esquema** | Cambiar las columnas de una tabla sin reescribir los datos. Iceberg identifica las columnas por un id interno, no por su nombre ni su posición. |
+| **Viaje en el tiempo** | Consultar la tabla tal y como estaba en una instantánea anterior. |
+| **Problema de los ficheros pequeños** | Un pipeline en streaming genera muchos ficheros diminutos, y leerlos cuesta más que leer pocos grandes. Se corrige compactándolos periódicamente. |
+| **Catálogo** | Servicio que sabe, por cada tabla, cuál es su fichero de metadatos vigente. Sin él los datos existen pero no son alcanzables por nombre. |
+| **Namespace** | Agrupación de tablas dentro de un catálogo, equivalente a un esquema. Aquí, `bronze` y `silver` dentro del catálogo `demo`. |
+| **Almacenamiento de objetos** | Guarda ficheros completos identificados por una clave, sin directorios reales y sin poder modificar un fichero a trozos. Es el modelo de S3 y de MinIO. |
+| **Bucket** | El contenedor de más alto nivel en un almacén de objetos. Aquí, `warehouse`. |
+
+### CDC y PostgreSQL
+
+| Término | Qué es |
+|---|---|
+| **CDC** | *Change Data Capture*: capturar los cambios de una base de datos según se producen, en vez de consultarla periódicamente. |
+| **WAL** | *Write-ahead log*: registro secuencial donde PostgreSQL anota cada cambio **antes** de aplicarlo. Existe para recuperarse de una caída, y es de donde el CDC lee. |
+| **Decodificación lógica** | Mecanismo que traduce el WAL, pensado para uso interno, a cambios comprensibles a nivel de fila. |
+| **LSN** | *Log sequence number*: posición exacta dentro del WAL. Define el orden real de los cambios. |
+| **Replication slot** | Marca que recuerda hasta dónde ha leído un consumidor del WAL. PostgreSQL conserva el WAL pendiente de ese slot, de ahí que un slot abandonado llene el disco. |
+| **Publication** | Declaración de qué tablas se publican para replicación lógica. |
+
+### Arquitectura y patrones
+
+| Término | Qué es |
+|---|---|
+| **OLTP / OLAP** | Carga transaccional (muchas operaciones pequeñas) frente a carga analítica (pocas consultas que leen muchísimo). |
+| **ETL / ELT** | Transformar antes de cargar, o cargar crudo y transformar ya dentro del almacén. El proyecto usa ELT. |
+| **Data lakehouse** | Arquitectura que junta el coste y la flexibilidad de un *data lake* con las garantías transaccionales de un *data warehouse*. |
+| **Arquitectura medallón** | Organización en capas `bronze` (crudo), `silver` (limpio) y `gold` (agregado). |
+| **Dead-letter queue** | Sitio aparte donde se apartan los eventos que no se pueden procesar, para que no detengan el flujo ni se pierdan en silencio. |
+| **Account shadow** | Una fila por cuenta con su estado más reciente, en vez de un histórico. Maximiza los `UPDATE`, que es lo que hace interesante el CDC. |
+| **Throughput** | Cuántos eventos se procesan por unidad de tiempo. |
+| **Latencia** | Cuánto tarda un evento concreto desde que se genera hasta que queda procesado. Throughput alto y latencia alta pueden darse a la vez. |
