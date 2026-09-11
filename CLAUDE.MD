@@ -562,6 +562,16 @@ Si durante el desarrollo se propone añadir una funcionalidad fuera de este alca
 - No introducir servicios de pago salvo autorización explícita del usuario.
 - La arquitectura debe poder ejecutarse en una única máquina de desarrollo.
 
+## 2026-09-11 — Cambio de decisión: una sola rama de trabajo
+
+- **Decisión anterior:** dos ramas, `main` estable y `tfg` de desarrollo, con la instrucción de no trabajar nunca directamente sobre `main`.
+- **Nueva decisión:** se trabaja **directamente sobre `main`**, que es la única rama del repositorio.
+- **Motivo del cambio:** decisión explícita del usuario. El flujo de dos ramas nunca llegó a usarse: `tfg` existía solo en local, jamás se subió a GitHub, y el repositorio remoto solo ha tenido `main`. Mantener una rama que nadie ve ni revisa añadía un paso sin aportar nada.
+- **Alternativas consideradas:** conservar `tfg` y subirla al remoto para trabajar con pull requests. Se descartó porque en un TFG de un solo autor el revisor es el propio usuario, que ya revisa antes de cada `push`; el punto de control real es el commit, no la rama.
+- **Impacto sobre la arquitectura:** ninguno.
+- **Impacto sobre la memoria:** el capítulo de metodología debe describir un flujo de rama única con commits atómicos, no un flujo de ramas paralelas.
+- **Estado de `tfg`:** la rama local se conservó tras llevar su contenido a `main` mediante un avance rápido. No se ha borrado porque borrar ramas requiere confirmación explícita.
+
 ## 2026 — Pregunta de investigación
 
 Pregunta provisional:
@@ -619,16 +629,19 @@ Los problemas técnicos relevantes son información útil para la memoria del TF
 
 - **Síntoma:** `SELECT slot_name, active FROM pg_replication_slots;` devuelve dos slots: `fraude_slot` (activo, el actual) e `iot_slot` (inactivo).
 - **Causa:** `iot_slot` lo creó el conector del caso de uso IoT anterior. Eliminar un conector de Debezium no elimina su replication slot en PostgreSQL.
-- **Estado:** **sin resolver, pendiente de decisión del usuario.** No se ha eliminado porque borrar un slot es una operación destructiva sobre la base de datos.
+- **Estado:** **resuelto el 2026-09-11**, con la aprobación del usuario. Antes de eliminarlo se midió cuánto WAL retenía cada slot: `iot_slot` acumulaba 1.428 kB frente a los 118 kB del slot activo, lo que confirmó el diagnóstico. Tras ejecutar `pg_drop_replication_slot` sobre él solo queda `fraude_slot`, y se comprobó que el conector sigue en `RUNNING`.
 - **Por qué importa:** un slot inactivo hace que PostgreSQL conserve indefinidamente todos los segmentos del WAL que ese slot todavía no ha consumido. El disco crece sin causa aparente y, en el peor caso, la base de datos se queda sin espacio. En un TFG cuya evaluación consiste en generar mucho volumen de eventos, no es un detalle menor.
 - **Solución propuesta:** `SELECT pg_drop_replication_slot('iot_slot');`, solo tras confirmación.
 
-### [2026-09-11] MinIO no tiene volumen persistente
+### [2026-09-11] El lakehouse no sobrevive a un `docker compose down`
 
-- **Síntoma:** el servicio `minio` del `docker-compose.yml` no declara ningún `volumes:`, así que `/data` vive en la capa de escritura del contenedor.
-- **Consecuencia:** todo el lakehouse (las tablas Iceberg de `bronze` y `silver`) desaparece con un `docker compose down`, aunque no se use `-v`. Solo sobrevive a `docker compose stop`.
-- **Estado:** **sin resolver, pendiente de decisión del usuario**, porque añadir un volumen modifica la configuración de la plataforma.
-- **Impacto en el TFG:** afecta directamente a la reproducibilidad de los experimentos. Un resultado experimental que no se puede volver a consultar tras reiniciar el entorno es difícil de defender. Conviene resolverlo antes de la fase 10.
+- **Síntoma:** ni el servicio `minio` ni el servicio `rest` declaran `volumes:` en el `docker-compose.yml`.
+- **Diagnóstico real (corregido tras inspeccionar los contenedores):** son dos problemas distintos, y el grave es el segundo.
+  - **MinIO sí tiene volumen, pero anónimo.** La imagen `minio/minio` declara `VOLUME /data` en su Dockerfile, así que Docker le crea un volumen anónimo con nombre aleatorio (verificado: `2ade2b47…`, con 2,3 MB de datos). Sobrevive a `restart` y a `stop`/`start`. Lo que no sobrevive es un `docker compose down`: el contenedor se elimina y el siguiente `up` crea uno nuevo con un volumen anónimo **nuevo y vacío**. Los datos no se borran, quedan varados en un volumen colgante — recuperables a mano, pero en la práctica perdidos, y acumulando basura en disco. Un `docker volume prune` sí los borra de verdad.
+  - **El catálogo Iceberg no tiene ningún volumen.** `tfg-iceberg-rest` arranca con `CATALOG_URI=jdbc:sqlite:/tmp/iceberg_catalog.db`, un fichero SQLite dentro de la capa de escritura del contenedor (verificado: su lista de montajes está vacía). Ese fichero es el que traduce `demo.bronze.eventos_cuenta` a la ruta de sus ficheros de metadatos. Si desaparece, los datos siguen en MinIO pero dejan de ser alcanzables como tabla.
+- **La trampa, que es lo peor del asunto:** los checkpoints de Spark **sí** persisten, porque viven en `/home/iceberg/warehouse/_checkpoints`, que es un *bind mount* a `./warehouse` del repositorio (verificado: 227 kB en el anfitrión). Tras un `down` + `up` queda un estado incoherente: el catálogo está vacío y las tablas ya no existen, pero Spark reanuda desde los offsets de Kafka que ya tenía guardados y **no vuelve a procesar esos eventos**. Las tablas se recrean vacías y pierden para siempre todo lo anterior, sin ningún error visible.
+- **Estado:** **sin resolver, pendiente de decisión del usuario**, porque la solución modifica el `docker-compose.yml`.
+- **Impacto en el TFG:** afecta directamente a la reproducibilidad de la fase 10. Un resultado experimental que no se puede volver a consultar tras reiniciar el entorno es difícil de defender, y un pipeline que pierde eventos en silencio contamina las métricas de integridad de la sección 14.3.
 
 ---
 
@@ -807,26 +820,23 @@ directa para la memoria académica del TFG, según la sección 17.
 
 ## Ramas
 
-El repositorio utilizará únicamente **dos ramas principales de trabajo**:
+El repositorio utiliza **una única rama: `main`**. Es la única que existe en GitHub y sobre la que se trabaja directamente.
 
-- `main` → rama estable.
-- `tfg` → rama de desarrollo del TFG.
+**Decisión del usuario del 2026-09-11**, que sustituye al flujo anterior de dos ramas (`main` + `tfg`). Ese flujo nunca llegó a usarse: `tfg` era local y nunca se subió. Ver la sección 6.
 
-Claude Code debe trabajar normalmente sobre `tfg` y **no debe trabajar directamente sobre `main`**.
+No hay que crear ramas por fase ni por funcionalidad. Si en algún momento hiciera falta una rama adicional, debe consultarse antes con el usuario.
 
-No es necesario crear una rama diferente para cada fase o funcionalidad. Las distintas fases del proyecto se desarrollarán de forma progresiva dentro de `tfg`.
+La rama `tfg` sigue existiendo en local, apuntando al mismo commit que `main`. No se ha borrado porque borrar ramas requiere confirmación explícita.
 
-Si en algún momento fuese necesario crear una rama adicional por una circunstancia excepcional, debe consultarse previamente con el usuario.
+## Publicación
 
-## Merge
-
-El usuario gestiona manualmente el merge de `tfg` a `main`.
+El usuario hace el `push` manualmente, después de revisar el código.
 
 Claude Code:
 
-- NO debe hacer merge automáticamente.
+- **NO debe hacer `git push` nunca.**
 - NO debe crear pull requests automáticamente.
-- Debe dejar `tfg` limpia, probada y documentada para que el usuario revise y decida cuándo integrarla en `main`.
+- Debe dejar `main` limpia, probada y documentada, con commits atómicos que el usuario pueda revisar uno a uno antes de publicar.
 
 ## Operaciones destructivas
 
@@ -1564,8 +1574,9 @@ Los dos jobs que escriben en Iceberg incluyen una función `asegurar_columnas` q
 
 Las métricas caen en `warehouse/_metricas/`, dentro de un directorio ya excluido del control de versiones, así que las medidas de un mismo experimento quedan juntas y no se versionan por accidente.
 
-### Decisiones pendientes que dejó esta sesión
+### Decisiones de esta sesión
 
-1. **Añadir `__pycache__/` a `.gitignore`.** Dos ficheros `.pyc` se colaron en un commit y hubo que sacarlos (`2cec394`). Volverán a colarse en el próximo `git add -A`. Modificar `.gitignore` requiere confirmación explícita según la sección 11.
-2. **Eliminar el replication slot huérfano `iot_slot`** (sección 7).
-3. **Dar volumen persistente a MinIO** (sección 7).
+1. ~~Añadir `__pycache__/` a `.gitignore`.~~ **Aprobado y aplicado** (`5047f9b`).
+2. ~~Eliminar el replication slot huérfano `iot_slot`.~~ **Aprobado y aplicado.** Ver la sección 7.
+3. **Dar persistencia al lakehouse.** Pendiente de decisión del usuario. El diagnóstico inicial era incorrecto y está corregido en la sección 7: MinIO sí tiene volumen, aunque anónimo; el que no tiene ninguno es el catálogo Iceberg, y los checkpoints de Spark sí persisten, lo que deja un estado incoherente tras un `down` + `up`.
+4. **Rama única `main`.** Decidido por el usuario. Los siete commits de la sesión se llevaron de `tfg` a `main` mediante un avance rápido. Ver las secciones 6 y 10.

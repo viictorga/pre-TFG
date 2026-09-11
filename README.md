@@ -331,11 +331,21 @@ docker compose down       # para los contenedores y conserva el volumen de Postg
 ```
 
 > **No ejecutes `docker compose down -v`** salvo que quieras borrar también el
-> volumen de Postgres. Y ten en cuenta que **MinIO no tiene volumen propio en el
-> `docker-compose.yml` actual**: los datos de Iceberg viven dentro del
-> contenedor, así que un `docker compose down` normal ya se los lleva por
-> delante. Si necesitas conservar el lakehouse entre sesiones, usa
-> `docker compose stop` o añade un volumen a MinIO.
+> volumen de Postgres.
+
+> **El lakehouse no sobrevive a un `docker compose down`**, ni siquiera sin `-v`.
+> El catálogo Iceberg guarda su índice de tablas en un SQLite dentro del
+> contenedor `tfg-iceberg-rest`, que no tiene ningún volumen, y MinIO usa un
+> volumen anónimo que Docker no reasigna al recrear el contenedor. Los
+> checkpoints de Spark, en cambio, sí persisten en `warehouse/_checkpoints`, así
+> que al volver a levantar el entorno los jobs reanudan desde los offsets
+> guardados y **no reprocesan** los eventos anteriores: las tablas se recrean
+> vacías y esos eventos se pierden sin ningún aviso.
+>
+> Mientras esto no se resuelva, usa **`docker compose stop`** en lugar de `down`
+> para conservar los datos entre sesiones. Si necesitas empezar de cero a
+> propósito, borra también `warehouse/_checkpoints` para que los jobs vuelvan a
+> leer el topic desde el principio.
 
 ## Estructura del repositorio
 
