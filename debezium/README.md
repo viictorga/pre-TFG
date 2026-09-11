@@ -1,166 +1,136 @@
-# TFG — Paso 1: Postgres + generador de dispositivos IoT
+# Captura de cambios (CDC) con Debezium
 
-Primera pieza del pipeline: una base de datos Postgres con una tabla
-`estado_dispositivo` (patrón *device shadow*) y un generador en Python que
-simula ~30 sensores IoT actualizando su lectura cada pocos segundos.
+Esta carpeta contiene la configuración del conector que captura los cambios de
+la tabla `estado_cuenta` en PostgreSQL y los publica como eventos en Kafka.
 
-Esto es intencionadamente lo mínimo posible — todavía no hay Kafka, ni
-Debezium, ni Spark. Es la base sobre la que se construye todo lo demás.
+Para levantar el entorno completo y el resto del pipeline, consulta el
+[`README.md`](../README.md) de la raíz del repositorio. Aquí solo se documenta
+la pieza de CDC.
 
-## Requisitos
+## Qué hace el conector
 
-- Docker y Docker Compose instalados
-- Python 3.9+
+Cada vez que el generador actualiza la fila de una cuenta en `estado_cuenta`,
+Debezium lee esa modificación del *write-ahead log* de PostgreSQL —sin
+consultar la tabla ni añadir carga a la base de datos— y publica un evento JSON
+en el topic `fraude.public.estado_cuenta`.
 
-## 1. Levantar Postgres
+Esa es la diferencia frente a una extracción por lotes: el evento aparece en
+Kafka en cuestión de milisegundos desde el `UPDATE`, y la base de datos origen
+no se entera.
 
-```bash
-docker compose up -d
-docker compose ps        # comprueba que aparece "healthy"
-```
+## Configuración: `register-connector.json`
 
-Esto crea la base de datos `iot`, el usuario `tfg` y la tabla
-`estado_dispositivo` automáticamente (usando `sql/init.sql`). También deja
-Postgres configurado con `wal_level=logical`, que es lo que necesitará
-Debezium más adelante para el CDC — así no hay que tocar esto otra vez.
-
-## 2. Instalar y lanzar el generador
-
-```bash
-cd generator
-python -m venv venv
-source venv/bin/activate        # en Windows: venv\Scripts\activate
-pip install -r requirements.txt
-python generate_devices.py
-```
-
-Deberías ver algo como:
-
-```
-sensor-005   temperatura  24.67C
-sensor-007   humedad      62.48%
-sensor-001   humedad      13.21%  <-- ANOMALIA
-```
-
-Para el generador con `Ctrl+C` cuando quieras.
-
-## 3. Comprobar los datos
-
-En otra terminal:
-
-```bash
-docker exec -it tfg-postgres psql -U tfg -d iot -c "SELECT * FROM estado_dispositivo ORDER BY fecha_actualizacion DESC LIMIT 10;"
-```
-
-Deberías ver **una fila por dispositivo** (no una por lectura) con el valor
-y el timestamp más recientes — eso es lo que hace que capturar solo los
-`UPDATE` con CDC tenga sentido en el siguiente paso.
-
-## Variables de entorno del generador
-
-| Variable | Por defecto | Qué hace |
+| Clave | Valor | Por qué |
 |---|---|---|
-| `NUM_DISPOSITIVOS` | 30 | Cuántos sensores simular |
-| `INTERVALO_SEGUNDOS` | 2 | Segundos entre lecturas |
-| `PROB_ANOMALIA` | 0.04 | Probabilidad de generar una lectura fuera de rango |
+| `connector.class` | `io.debezium.connector.postgresql.PostgresConnector` | Conector de PostgreSQL |
+| `database.*` | `postgres:5432`, base `iot`, usuario `tfg` | El host es el nombre del servicio en la red de Docker, no `localhost` |
+| `topic.prefix` | `fraude` | Primer segmento del nombre del topic: `fraude.public.estado_cuenta` |
+| `table.include.list` | `public.estado_cuenta` | Solo se captura esa tabla |
+| `plugin.name` | `pgoutput` | Plugin de decodificación lógica incluido en PostgreSQL desde la versión 10; no hay que instalar nada |
+| `slot.name` | `fraude_slot` | Nombre del *replication slot* que Debezium crea en Postgres |
+| `publication.autocreate.mode` | `filtered` | Crea la publicación solo para las tablas de `table.include.list` |
+| `decimal.handling.mode` | `double` | Sin esto, los `NUMERIC` viajan como bytes codificados en Base64 y Spark no los puede leer como número |
 
-Ejemplo para probar más rápido y con más anomalías:
+El requisito previo del lado de PostgreSQL es `wal_level=logical`, que ya viene
+puesto en el `command` del servicio `postgres` en `docker-compose.yml`.
 
-```bash
-NUM_DISPOSITIVOS=10 INTERVALO_SEGUNDOS=0.5 PROB_ANOMALIA=0.2 python generate_devices.py
-```
+## Registrar el conector
 
-## Parar y limpiar
-
-```bash
-docker compose down       # para Postgres, conserva los datos
-docker compose down -v    # para Postgres y borra los datos
-```
-
-## Siguiente paso
-
-Con esto funcionando, el siguiente paso del cronograma es añadir Debezium +
-Kafka y comprobar que cada `UPDATE` sobre `estado_dispositivo` aparece como
-un evento CDC — todavía sin Spark ni Iceberg.
-
----
-
-# Paso 2: Debezium + Kafka (captura de cambios en streaming)
-
-> **Nota honesta:** esta parte sigue el patrón oficial de los tutoriales de
-> Debezium casi al pie de la letra (es el más fiable que existe para esto),
-> pero no he podido ejecutarla yo mismo de extremo a extremo porque mi
-> entorno de pruebas no tiene acceso a Docker Hub / quay.io. Si algo falla,
-> dímelo con el mensaje de error exacto y lo resolvemos juntos.
-
-## 1. Levantar Kafka y Debezium
-
-Con el nuevo `docker-compose.yml` (ya incluye Zookeeper, Kafka y Connect):
-
-```bash
-docker compose up -d
-docker compose ps
-```
-
-Deberías ver 4 contenedores: `tfg-postgres`, `tfg-zookeeper`, `tfg-kafka` y
-`tfg-connect`. Dale 20-30 segundos a `tfg-connect` para arrancar del todo —
-es el que más tarda.
-
-## 2. Registrar el conector
-
-Comprueba que Connect está despierto:
+Con el entorno levantado y `tfg-connect` arrancado del todo (tarda 20-30
+segundos más que el resto), desde la raíz del repositorio:
 
 ```bash
 curl -s http://localhost:8083/connectors
 ```
 
-Debería devolver `[]` (ningún conector registrado todavía). Ahora regístralo:
+Devuelve `[]` mientras no haya ningún conector registrado. Para registrarlo:
 
 ```bash
 curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" \
   localhost:8083/connectors/ -d @debezium/register-connector.json
 ```
 
-Una respuesta `201 Created` significa que se ha registrado bien. Comprueba
-su estado:
+Respuesta esperada: `HTTP/1.1 201 Created`. Comprobar su estado:
 
 ```bash
-curl -s localhost:8083/connectors/iot-connector/status
+curl -s localhost:8083/connectors/fraude-connector/status
 ```
 
-Busca `"state":"RUNNING"` tanto en el conector como en la tarea.
+Tanto el conector como su tarea deben aparecer en `"state":"RUNNING"`.
 
-## 3. Ver los eventos CDC en directo
+## Ver los eventos CDC en directo
 
-Con el generador (`generate_devices.py`) corriendo en otra terminal, consume
-el topic donde Debezium publica los cambios:
+Con el generador corriendo en otra terminal:
 
 ```bash
 docker exec -it tfg-kafka /kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic iot.public.estado_dispositivo \
+  --bootstrap-server kafka:9092 \
+  --topic fraude.public.estado_cuenta \
   --from-beginning
 ```
 
-Cada vez que el generador actualice un dispositivo, debería aparecer aquí
-un evento JSON nuevo casi al instante — esa latencia mínima entre el UPDATE
-en Postgres y el evento en Kafka es exactamente lo que hace valioso el CDC
-frente a una extracción por lotes.
+> Dentro del contenedor hay que usar `kafka:9092`, no `localhost:9092`: el
+> broker anuncia su nombre de servicio y con `localhost` la herramienta se queda
+> reintentando hasta agotar el tiempo de espera.
 
-## Solución de problemas habituales
+> En Git Bash sobre Windows, exporta antes `MSYS_NO_PATHCONV=1` o usa
+> PowerShell: Git Bash convierte `/kafka/bin/...` en una ruta de Windows y el
+> `docker exec` falla con `no such file or directory`.
 
-- **El POST del conector devuelve `500` o un error de "replication slot"**:
-  espera unos segundos más a que Postgres y Kafka terminen de arrancar y
-  reinténtalo — es una condición de carrera típica en el primer arranque.
-- **`tfg-connect` se reinicia en bucle**: revisa sus logs con
-  `docker logs tfg-connect` — casi siempre es que Kafka todavía no estaba
-  listo cuando Connect intentó conectarse.
-- **El topic no existe cuando intentas consumirlo**: el topic se crea solo
-  cuando llega el primer evento. Asegúrate de que el generador está
-  corriendo y de que el conector está en estado `RUNNING`.
+Cada evento es un sobre JSON con esta forma (recortada):
 
-## Siguiente paso
+```json
+{
+  "payload": {
+    "before": { "...": "estado anterior de la fila" },
+    "after": {
+      "id_cuenta": "cuenta-012",
+      "tipo_transaccion": "compra_online",
+      "importe": 43.9,
+      "ubicacion": "Madrid",
+      "resultado": "aprobada"
+    },
+    "op": "u",
+    "source": { "...": "metadatos: LSN, timestamp, tabla de origen" }
+  }
+}
+```
 
-Con los eventos CDC llegando a Kafka, el siguiente bloque del cronograma es
-Spark Structured Streaming: consumirlos, detectar anomalías por ventana
-deslizante, y escribirlos en la capa bronze del lakehouse (Iceberg).
+El campo `op` indica la operación: `c` (create/insert), `u` (update), `d`
+(delete) y `r` (read, la instantánea inicial). Los scripts de Spark leen
+`payload.after` y descartan el resto del sobre.
+
+## Gestión del conector
+
+```bash
+# Listar conectores registrados
+curl -s localhost:8083/connectors
+
+# Reiniciar el conector (no borra el replication slot ni los offsets)
+curl -X POST localhost:8083/connectors/fraude-connector/restart
+
+# Eliminar el conector
+curl -X DELETE localhost:8083/connectors/fraude-connector
+```
+
+**Precaución:** eliminar el conector no elimina su *replication slot* en
+PostgreSQL. Un slot huérfano hace que PostgreSQL conserve indefinidamente los
+segmentos del WAL que ese slot aún no ha consumido, y el disco se va llenando
+sin motivo aparente. Para comprobarlos y, si hace falta, liberarlos:
+
+```bash
+docker exec -it tfg-postgres psql -U tfg -d iot \
+  -c "SELECT slot_name, active, restart_lsn FROM pg_replication_slots;"
+```
+
+## Problemas habituales
+
+- **El `POST` devuelve 500 o un error de *replication slot*:** Postgres o Kafka
+  todavía no habían terminado de arrancar. Espera unos segundos y reinténtalo;
+  es una condición de carrera típica del primer arranque.
+- **`tfg-connect` se reinicia en bucle:** revisa `docker logs tfg-connect`. Casi
+  siempre es que Kafka no estaba listo cuando Connect intentó conectarse.
+- **El topic no existe al intentar consumirlo:** se crea con el primer evento.
+  Comprueba que el generador está corriendo y que el conector está en `RUNNING`.
+- **Los importes llegan como texto raro tipo `"BCg="`:** falta
+  `decimal.handling.mode: double` en la configuración del conector.
