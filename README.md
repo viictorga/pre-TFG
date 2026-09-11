@@ -120,6 +120,9 @@ Todos se controlan por variable de entorno:
 | `INTERVALO_SEGUNDOS` | 2 | Segundos entre transacciones |
 | `PROB_ANOMALIA` | 0.04 | Probabilidad de generar una transacción con importe anómalo |
 | `PROB_RECHAZO` | 0.05 | Probabilidad de que la transacción salga rechazada |
+| `DURACION_SEGUNDOS` | 0 | Segundos hasta detenerse solo; `0` = hasta `Ctrl+C` |
+| `SEMILLA` | — | Fija la secuencia aleatoria y hace la ejecución reproducible |
+| `ETIQUETA` | `generador` | Prefijo del fichero de resumen, para nombrar el experimento |
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | Conexión a Postgres |
 | `DB_NAME` / `DB_USER` / `DB_PASSWORD` | `iot` / `tfg` / `tfg_pass` | Credenciales |
 
@@ -148,6 +151,63 @@ calculan precisión y exhaustividad. **Ninguna lógica de detección lee la
 etiqueta**: el z-score se calcula solo con el importe y el histórico de la
 cuenta, igual que en un sistema real, donde nadie sabe de antemano qué
 transacción es fraude.
+
+### Modo de pico de carga
+
+Con `PICO_ACTIVO=true` el generador alterna su ritmo normal con ráfagas muy por
+encima de la frecuencia habitual. La ráfaga simula un ataque de *card testing*:
+unas pocas cuentas emiten en segundos muchos cargos pequeños, que es como se
+comprueba si una tarjeta robada sigue activa.
+
+| Variable | Por defecto | Qué hace |
+|---|---|---|
+| `PICO_ACTIVO` | `false` | Activa el modo de pico |
+| `PICO_ESPERA_SEGUNDOS` | 60 | Espera antes de la primera ráfaga, y entre ráfagas |
+| `PICO_DURACION_SEGUNDOS` | 30 | Cuánto dura cada ráfaga |
+| `PICO_INTERVALO_SEGUNDOS` | 0.01 | Segundos entre eventos durante la ráfaga; `0` = lo más rápido posible |
+| `PICO_REPETICIONES` | 1 | Cuántas ráfagas se lanzan |
+| `PICO_NUM_CUENTAS` | 5 | Cuántas cuentas participan en la ráfaga |
+| `PICO_IMPORTE_MAX` | 3.0 | Importe máximo de los cargos de la ráfaga |
+
+Ejemplo de experimento completo, de 150 segundos con una ráfaga de 30 a partir
+del segundo 45:
+
+```bash
+SEMILLA=tfg2026 DURACION_SEGUNDOS=150 NUM_CUENTAS=20 INTERVALO_SEGUNDOS=1 \
+PICO_ACTIVO=true PICO_ESPERA_SEGUNDOS=45 PICO_DURACION_SEGUNDOS=30 \
+PICO_INTERVALO_SEGUNDOS=0 PICO_NUM_CUENTAS=5 ETIQUETA=experimento_pico \
+python generator/generate_transactions.py
+```
+
+Las ráfagas se planifican **antes** de empezar, así que el generador imprime al
+arrancar en qué segundo empieza y acaba cada una, y avisa por consola al entrar
+y al salir de cada ráfaga.
+
+Las transacciones de una ráfaga **no se marcan como anómalas**. Lo sospechoso del
+card testing es el ritmo, no el importe: cada cargo por separado es
+indistinguible de una compra pequeña normal. Marcarlas como anómalas falsearía la
+exhaustividad, midiendo al detector con un patrón que no fue diseñado para ver.
+
+### Resumen del experimento
+
+Al terminar, el generador escribe en `warehouse/_metricas/` un JSON con la
+configuración usada, los contadores de lo generado y las marcas temporales
+exactas de cada ráfaga:
+
+```json
+{
+  "duracion_real_s": 150.3,
+  "contadores": { "total": 20890, "en_pico": 20770, "anomalas": 3 },
+  "ritmo_medio_eventos_s": 139.01,
+  "ventanas_pico": [{ "inicio": "...T16:43:56Z", "fin": "...T16:44:11Z" }]
+}
+```
+
+Sirve para dos cosas: superponer las ventanas de ráfaga sobre las gráficas de
+métricas, y saber cuántos eventos se generaron de verdad. Este segundo dato no se
+puede obtener después consultando PostgreSQL, porque con el patrón *account
+shadow* solo se conserva la última transacción de cada cuenta — y es la
+referencia necesaria para medir si el pipeline perdió eventos.
 
 ## 4. Comprobar que los datos llegan
 
@@ -275,9 +335,16 @@ entero. Columnas del CSV:
 | `duracion_escritura_ms` | Cuánto se fue en escribir en Iceberg |
 | `lag_maximo` / `lag_medio` | **Consumer lag**: eventos ya en Kafka que el job aún no ha leído |
 
-El `lag` es la señal clave en las pruebas de pico de carga: mientras se
-mantenga cerca de cero, el job va al día; si empieza a crecer, el
-procesamiento se está quedando por detrás de la ingesta.
+> **Cuidado al interpretar el `lag`.** Con la configuración actual vale **0
+> siempre**, incluso durante un pico de carga. Los jobs no tienen
+> `maxOffsetsPerTrigger`, así que Spark consume en cada micro-lote todo lo que
+> hay disponible y la resta «último offset menos leído» da cero por definición.
+> No mide holgura: no mide nada.
+>
+> Mientras eso no se configure, los indicadores útiles de saturación son
+> `filas_entrada` —cuánto se acumuló entre disparos— y la comparación entre
+> `duracion_total_ms` y el intervalo del *trigger*: si un micro-lote tarda más
+> que su propio intervalo de forma sostenida, el job se está quedando atrás.
 
 ### Consumo de CPU y memoria
 

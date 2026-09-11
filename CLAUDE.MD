@@ -346,7 +346,7 @@ Las fases son provisionales y pueden modificarse.
 
 Una fase solo debe marcarse como completada cuando haya sido **probada y funcione de extremo a extremo**, no simplemente porque el código exista.
 
-**Estado a 2026-09-11.** Completas y verificadas: la **fase 3** (entorno base) y la **fase 6** (detección de anomalías, a falta de calibrar el umbral). Parciales: la **fase 1** (faltan el estado del arte, la validación con el tutor y la arquitectura definitiva), la **fase 4** (faltan los modos de pico de carga y de eventos corruptos) y la **fase 5** (falta separar los eventos corruptos). Sin empezar: las fases 2, 8, 9, 10 y 11. La **fase 7** tiene ya la instrumentación de medida construida, pero ningún escenario de estrés ejecutado.
+**Estado a 2026-09-11.** Completas y verificadas: la **fase 3** (entorno base) y la **fase 6** (detección de anomalías, a falta de calibrar el umbral). Parciales: la **fase 1** (faltan el estado del arte, la validación con el tutor y la arquitectura definitiva), la **fase 4** (falta el modo de eventos corruptos) y la **fase 5** (falta separar los eventos corruptos). Sin empezar: las fases 2, 8, 9, 10 y 11. La **fase 7** tiene ya la instrumentación de medida construida, pero ningún escenario de estrés ejecutado.
 
 ## Fase 1 — Definición y estado del arte
 
@@ -392,7 +392,7 @@ Una fase solo debe marcarse como completada cuando haya sido **probada y funcion
 - [x] Implementar generador de datos de transacciones bancarias.
 - [x] Implementar generación de eventos normales.
 - [x] Implementar inyección controlada de anomalías.
-- [ ] Implementar modo de pico de carga.
+- [x] Implementar modo de pico de carga.
 - [ ] Implementar modo de eventos corruptos.
 - [x] Configurar Debezium.
 - [x] Comprobar captura de INSERT/UPDATE.
@@ -671,6 +671,24 @@ Los problemas técnicos relevantes son información útil para la memoria del TF
 - **Resultado, verificado:** se reconstruyeron las 2.511 filas de `bronze`, se ejecutó `docker compose down` y `docker compose up -d`, y la tabla siguió ahí con las mismas 2.511 filas y 420 anomalías. Antes del cambio ese mismo `down` la habría vaciado en silencio.
 - **Impacto en el TFG:** elimina un riesgo directo sobre la reproducibilidad de la fase 10 y sobre las métricas de integridad de la sección 14.3, que un pipeline capaz de perder eventos sin avisar habría contaminado.
 
+### [2026-09-11] El consumer lag vale 0 por construcción, no porque el sistema vaya sobrado
+
+- **Síntoma:** en la primera prueba del modo de pico de carga, la ráfaga se ve perfectamente en las métricas —las filas por micro-lote pasan de 10 a 6.974 y el throughput de 10 a 7.369 filas/s— pero el `lag_maximo` permanece en **0 en todos los micro-lotes**, incluso durante el pico.
+- **Causa:** el lag se toma de `maxOffsetsBehindLatest`, que la fuente de Kafka calcula como la diferencia entre el último offset disponible y el último que el micro-lote ha leído. Como los jobs **no tienen configurado `maxOffsetsPerTrigger`**, Spark consume en cada micro-lote *todo* lo que hay disponible, así que ese valor es cero por definición. No mide que el sistema vaya holgado: mide una resta que siempre da cero.
+- **Corrección:** esto invalida lo que se había documentado antes, que presentaba el consumer lag como la señal principal de las pruebas de pico. **Con la configuración actual, el lag no sirve como indicador de saturación.**
+- **Qué usar en su lugar, mientras tanto:** `filas_entrada` por micro-lote, que sí refleja cuánto se ha acumulado entre disparos, y sobre todo la comparación entre `duracion_total_ms` y el intervalo del *trigger*. Mientras un micro-lote tarde menos que su intervalo, el job va al día; cuando lo supere de forma sostenida, se estará quedando atrás. En la prueba, los micro-lotes tardaron entre 927 y 1.074 ms frente a un trigger de 10 s: un margen de casi diez veces.
+- **Cómo hacer que el lag vuelva a ser informativo:** fijar `maxOffsetsPerTrigger` para acotar cuántos eventos entra en cada micro-lote. Entonces un pico que supere ese límite deja eventos esperando y el lag pasa a medir exactamente eso. **Y es, además, un excelente parámetro de configuración que estudiar** en la matriz de experimentos de la fase 10: relaciona directamente tamaño de micro-lote con latencia y con capacidad de absorción, que es el núcleo de la pregunta de investigación.
+- **Impacto en el TFG:** afecta al diseño de los experimentos de la fase 10 y a cómo se interpretan sus resultados. Un lag de cero no se puede presentar como prueba de que la plataforma aguanta si es cero por construcción.
+
+### [2026-09-11] El generador es el cuello de botella, no la plataforma
+
+- **Síntoma:** con `PICO_INTERVALO_SEGUNDOS=0`, es decir, generando tan rápido como puede, el generador alcanza unos **692 eventos/s**. Con `PICO_INTERVALO_SEGUNDOS=0.005`, que pediría 200 eventos/s, alcanza solo 140.
+- **Causa:** el generador es un único proceso de Python que hace un `INSERT ... ON CONFLICT` síncrono por transacción. Cada una es un viaje de ida y vuelta a PostgreSQL, y ese coste marca el techo. El `time.sleep()` tampoco es preciso por debajo de unos pocos milisegundos, de ahí que 0,005 s no dé los 200 eventos/s teóricos.
+- **Consecuencia:** Spark procesó esos 692 eventos/s en micro-lotes de aproximadamente un segundo. **La plataforma no llegó a despeinarse, así que este pico no es todavía una prueba de estrés real.**
+- **Opciones para subir el techo, si hiciera falta:** agrupar varias transacciones por transacción de base de datos (`execute_batch` de psycopg2), lanzar varios procesos generadores en paralelo, o aceptar el techo actual y estrechar artificialmente el pipeline con `maxOffsetsPerTrigger`.
+- **Recomendación:** empezar por lo segundo. Estrechar el pipeline es más barato que acelerar el generador, y además convierte el estrangulamiento en un parámetro de configuración medible, que es justo lo que la pregunta de investigación quiere estudiar. Acelerar el generador solo es necesario si se quiere conocer el límite absoluto de la plataforma.
+- **Impacto en el TFG:** es un dato honesto y necesario para la memoria. Sin él, un lector podría interpretar «el sistema absorbió el pico sin degradarse» como una medida de la capacidad de la plataforma, cuando en realidad mide la capacidad del generador.
+
 ### [2026-09-11] Kafka y el conector tampoco sobreviven a un `docker compose down`
 
 - **Síntoma:** detectado al verificar la solución del problema anterior. Tras `docker compose down` y `up -d`, el tópico `fraude.public.estado_cuenta` había desaparecido y `curl localhost:8083/connectors` devolvía `[]`: el conector ya no estaba registrado.
@@ -725,6 +743,29 @@ Formato recomendado:
 ```
 
 Los datos utilizados en la memoria final deben proceder de pruebas reproducibles siempre que sea posible.
+
+### [2026-09-11] Prueba: primer pico de carga
+
+Primera ejecución del modo de pico de carga (tarea 30), con el job de `bronze` corriendo e instrumentado.
+
+- **Objetivo:** comprobar que el modo de pico genera una ráfaga real, que atraviesa el pipeline completo y que la instrumentación la captura.
+- **Configuración:** `SEMILLA=tfg2026`, 20 cuentas, ritmo normal de 1 evento/s, duración total 150 s. Una ráfaga de 30 s comenzando en t+45 s, con `PICO_INTERVALO_SEGUNDOS=0` (máximo ritmo posible) sobre 5 cuentas. Trigger de `bronze` a 10 s.
+- **Carga generada:** 20.890 eventos en 150,3 s. De ellos, **20.770 dentro de la ráfaga de 30 s**.
+
+| Régimen | Ritmo de generación | Filas por micro-lote | Throughput de Spark | Duración del micro-lote |
+|---|---|---|---|---|
+| Normal | 1 evento/s | ~10 | ~10 filas/s | ~1.000 ms |
+| Pico | **692 eventos/s** | hasta **6.974** | hasta **7.369 filas/s** | 927–1.074 ms |
+
+- **Consumer lag:** 0 en los 15 micro-lotes, también durante el pico. Ver la sección 7: es cero por construcción, no por holgura.
+- **Comprobación de extremo a extremo:** las transacciones de card testing llegaron a `bronze`. Consultando las compras online de menos de 3 €, aparecen **22.828 filas con un importe medio de 1,75 €**, coherente con el patrón inyectado.
+
+**Conclusiones:**
+
+1. **El modo de pico funciona y es claramente observable.** Un salto de 1 a 692 eventos/s se traduce en micro-lotes que pasan de 10 a casi 7.000 filas. La ráfaga queda perfectamente delimitada en el resumen JSON del generador, con sus marcas temporales absolutas, lo que permite superponerla sobre las gráficas de métricas.
+2. **La plataforma absorbió el pico sin degradarse.** La duración del micro-lote apenas se movió: entre 927 y 1.074 ms frente a un *trigger* de 10 s, es decir, casi un factor diez de margen. Procesar 6.974 filas le costó lo mismo que procesar 10, lo que sugiere que a estos volúmenes domina el coste fijo de cada micro-lote y no el de los datos.
+3. **Este pico todavía no es una prueba de estrés.** El límite lo pone el generador, no la plataforma (sección 7). Para provocar degradación observable hay que estrechar el pipeline con `maxOffsetsPerTrigger` o acelerar el generador.
+4. **El detector de anomalías es ciego al card testing, como se esperaba.** Las 20.770 transacciones de la ráfaga llevan importes de entre 0,50 y 3 €: lejísimos de superar un z-score de 3 por arriba. Es una limitación real del método estadístico elegido y conviene presentarla como tal en la memoria: el z-score sobre el importe detecta el fraude por cuantía, no el fraude por frecuencia. Detectar el card testing exigiría una métrica sobre el ritmo de transacciones por cuenta y unidad de tiempo, no sobre su importe.
 
 ### [2026-09-11] Prueba: primera medición de detección, throughput y latencia
 

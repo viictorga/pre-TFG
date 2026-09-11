@@ -4,7 +4,7 @@ Documento de seguimiento del TFG. Recoge el estado real del proyecto y las 90
 tareas del plan por fases, explicada cada una, indicando cuáles están terminadas
 y qué implica cada una de las que quedan.
 
-**Última actualización:** 2026-09-11 · **29 de 90 tareas completadas (32 %)**
+**Última actualización:** 2026-09-11 · **30 de 90 tareas completadas (33 %)**
 
 Una tarea solo se marca como hecha cuando se ha **probado y funciona de extremo a
 extremo**. Que el código exista no basta.
@@ -33,7 +33,7 @@ generador Python ──► PostgreSQL ──CDC──► Debezium ──► Kafk
 **Fases parciales:**
 
 - **Fase 1 — Definición.** Todas las decisiones de alcance tomadas y registradas. Faltan el estado del arte, la validación con el tutor y la arquitectura definitiva.
-- **Fase 4 — Generador y CDC.** Generación y captura funcionando. Faltan los dos modos de estrés.
+- **Fase 4 — Generador y CDC.** Generación, captura y modo de pico de carga funcionando. Falta el modo de eventos corruptos.
 - **Fase 5 — Streaming y bronze.** Ingesta y persistencia funcionando. Falta separar los eventos corruptos.
 
 **Sin empezar:** fases 2, 8, 9, 10 y 11.
@@ -45,8 +45,10 @@ pregunta de investigación.
 
 ### Métricas ya medidas
 
-Primera medición real del pipeline, del 2026-09-11. Es una línea base de
-verificación, no un experimento formal.
+Dos mediciones del 2026-09-11. Son líneas base de verificación, no experimentos
+formales.
+
+#### Régimen normal
 
 | Métrica | Valor |
 |---|---|
@@ -66,10 +68,23 @@ anomalías las que inflan la media y la desviación sobre las que se calcula el
 z-score. Hay que repetirla con el valor por defecto del 4 % antes de juzgar la
 calidad de la detección.
 
-### Dos limitaciones que condicionan lo que queda
+#### Primer pico de carga
+
+Ráfaga de 30 s sobre 5 cuentas, dentro de una ejecución de 150 s.
+
+| Régimen | Generación | Filas por micro-lote | Throughput de Spark | Duración del micro-lote |
+|---|---|---|---|---|
+| Normal | 1 evento/s | ~10 | ~10 filas/s | ~1.000 ms |
+| Pico | **692 eventos/s** | hasta **6.974** | hasta **7.369 filas/s** | 927–1.074 ms |
+
+20.890 eventos generados, 20.770 de ellos dentro de la ráfaga. Las 22.828
+transacciones de card testing llegaron a `bronze` con un importe medio de 1,75 €.
+
+### Tres limitaciones que condicionan lo que queda
 
 - **Spark consume 4,2 de los 7,9 GiB disponibles para Docker.** Es el techo real de la máquina. Conviene comprobar que Airflow y Metabase caben antes de añadirlos.
-- **Con 20 eventos/s el consumer lag se mantuvo en 0.** El sistema va sobrado, así que esa carga no sirve como prueba de estrés: habrá que subirla bastante hasta observar degradación.
+- **El consumer lag vale 0 por construcción.** Sin `maxOffsetsPerTrigger`, Spark consume en cada micro-lote todo lo disponible, así que la métrica siempre da cero, también durante un pico. No mide holgura: no mide nada. Para que informe hay que acotar el tamaño del micro-lote, lo que además convierte ese límite en un buen parámetro experimental.
+- **El generador es hoy el cuello de botella, no la plataforma.** Su techo está en unos 692 eventos/s, y Spark los procesó en micro-lotes de ~1 s frente a un *trigger* de 10 s. Para provocar degradación observable hay que estrechar el pipeline o acelerar el generador (inserciones por lotes, o varios procesos en paralelo).
 
 ---
 
@@ -122,12 +137,12 @@ que la fase entrega. Por eso ninguna está marcada.
 
 ### Fase 4 — Generador de datos y CDC
 
-> **Entregable:** datos sintéticos capturados como eventos CDC. **Conseguido en su parte básica; faltan los modos de estrés.**
+> **Entregable:** datos sintéticos capturados como eventos CDC. **Conseguido, con el modo de pico de carga incluido; falta el de eventos corruptos.**
 
 - [x] **27. Implementar generador de transacciones bancarias.** `generator/generate_transactions.py`, en Python con Faker. Simula cuentas que actualizan su fila en `estado_cuenta`, generando muchos más `UPDATE` que `INSERT`, que es el escenario donde el CDC aporta valor.
 - [x] **28. Implementar generación de eventos normales.** Cuatro tipos de transacción (compra online, compra presencial, retirada en cajero y transferencia), cada uno con su canal, su rango de importe normal y su categoría de comercio cuando aplica.
 - [x] **29. Implementar inyección controlada de anomalías.** Parámetro `PROB_ANOMALIA`. Genera importes fuera del rango del tipo y, la mitad de las veces, también desde una ciudad distinta a la habitual de la cuenta. Persiste la etiqueta de verdad en `es_anomalia_generada` y `tipo_anomalia_generada`.
-- [ ] **30. Implementar modo de pico de carga.** Ráfagas de transacciones muy por encima de la frecuencia habitual, simulando un ataque de *card testing*. **Es la tarea más crítica pendiente:** sin ella no hay experimento de estrés, que es la mitad de la pregunta de investigación. Debería ser configurable en intensidad, duración y momento de inicio.
+- [x] **30. Implementar modo de pico de carga.** `PICO_ACTIVO=true` alterna el ritmo normal con ráfagas de *card testing*: unas pocas cuentas emitiendo muchos cargos pequeños. Configurable en intensidad, duración, número de ráfagas, cuentas implicadas y momento de inicio. Las ventanas se planifican de antemano y se registran con marcas temporales absolutas en el resumen JSON, para poder superponerlas sobre las gráficas de métricas. Verificado: salto de 1 a **692 eventos/s**, micro-lotes de Spark de 10 a 6.974 filas, y 22.828 transacciones de la ráfaga persistidas en `bronze`.
 - [ ] **31. Implementar modo de eventos corruptos.** Eventos malformados: tipos incorrectos, campos ausentes, valores no numéricos. **Tiene una decisión de diseño abierta:** no se puede inyectar corrupción a través de PostgreSQL, porque su esquema es tipado y rechaza los datos inválidos. Hay que elegir entre un productor Kafka paralelo que escriba directamente en el tópico, o campos de texto libre en la tabla.
 - [x] **32. Configurar Debezium.** Conector `fraude-connector` sobre `public.estado_cuenta`, publicando en `fraude.public.estado_cuenta`. Configuración documentada clave por clave en `debezium/README.md`.
 - [x] **33. Comprobar captura de INSERT/UPDATE.** Verificado: cada `UPSERT` del generador aparece como evento CDC con su `op` correspondiente.
@@ -167,11 +182,11 @@ lo que estas tareas piden es medir *bajo carga*, no tener con qué medir.
 - [ ] **48. Implementar DLQ.** Un tópico Kafka dedicado a eventos fallidos, conservando el contenido original, el motivo del fallo y los metadatos necesarios para reprocesarlos. **Es la segunda aportación diferencial del TFG y hoy no existe nada.**
 - [ ] **49. Implementar aislamiento de eventos corruptos.** Que un evento inválido acabe en la DLQ en vez de tumbar el job o desaparecer sin dejar rastro.
 - [ ] **50. Comprobar que un evento corrupto no detiene el pipeline.** Prueba explícita: inyectar corrupción con el pipeline en marcha y verificar que el resto del flujo sigue procesándose con normalidad.
-- [ ] **51. Implementar escenarios de pico de carga.** Ejecutar el modo de pico (tarea 30) de forma controlada y reproducible sobre el pipeline en funcionamiento.
-- [ ] **52. Medir consumer lag.** La instrumentación existe: se toma de `maxOffsetsBehindLatest`, que publica la fuente de Kafka. Falta medirlo bajo estrés, cuando deje de ser 0.
+- [ ] **51. Implementar escenarios de pico de carga.** El modo de pico ya existe y se ha ejecutado una vez sobre el pipeline en marcha. Falta definir los escenarios concretos que entran en la evaluación y ejecutarlos de forma sistemática. **Antes hay que resolver el problema del techo del generador:** a 692 eventos/s la plataforma ni se inmuta, así que ese pico no llega a ser una prueba de estrés.
+- [ ] **52. Medir consumer lag.** La instrumentación existe, pero se ha descubierto que **el lag vale 0 por construcción**: sin `maxOffsetsPerTrigger`, Spark consume en cada micro-lote todo lo disponible y la métrica siempre da cero. Para que mida algo hay que acotar el tamaño del micro-lote, lo que de paso convierte ese límite en un parámetro experimental interesante.
 - [ ] **53. Medir throughput.** Instrumentado y registrado por micro-lote. Falta medirlo en condiciones de saturación.
 - [ ] **54. Medir latencia.** Calculable comparando `fecha_actualizacion` y `fecha_ingesta` en `bronze`. Falta medirla bajo carga y separando el transitorio de arranque del régimen estacionario.
-- [ ] **55. Comprobar pérdida de eventos.** Comparar los eventos generados con los persistidos más los enviados a la DLQ. **Requiere que el generador lleve su propio contador**, porque PostgreSQL no conserva el histórico al usar el patrón *account shadow*.
+- [ ] **55. Comprobar pérdida de eventos.** Comparar los eventos generados con los persistidos más los enviados a la DLQ. **La dependencia ya está resuelta:** el generador escribe al terminar un resumen JSON con el recuento exacto de lo emitido, que es el dato que PostgreSQL no puede dar al usar el patrón *account shadow*. Falta la comparación en sí, y que exista la DLQ.
 - [ ] **56. Evaluar backpressure y capacidad de absorción.** Hasta dónde absorbe Kafka un pico sin que se pierda nada, y cómo se comporta Spark cuando el ritmo de llegada supera al de procesamiento.
 
 ### Fase 8 — Transformaciones ELT
@@ -237,12 +252,11 @@ existe para hacerla posible.
 
 Por orden de prioridad:
 
-1. **Modo de pico de carga (tarea 30).** Desbloquea la fase 7 entera, ya tiene instrumentación con la que medirse y es lo más directamente ligado a la pregunta de investigación.
+1. **Configurar `maxOffsetsPerTrigger` (tareas 52, 56, 75).** Es lo que convierte el consumer lag en una métrica con sentido y, de paso, añade un parámetro de configuración que relaciona tamaño de micro-lote con latencia y capacidad de absorción: justo el núcleo de la pregunta de investigación. Con el modo de pico ya construido, es el paso que hace que las pruebas de estrés midan algo.
 2. **Modo de eventos corruptos y DLQ (tareas 31, 48, 49, 50).** La segunda aportación diferencial del TFG. Antes hay que resolver la decisión de por dónde se inyecta la corrupción.
 3. **Calibrar el detector (tarea 45).** Repetir la medición con `PROB_ANOMALIA=0.04` para obtener una exhaustividad que signifique algo.
 4. **Parametrizar `VENTANA_LECTURAS` y `Z_SCORE_UMBRAL` (tarea 75).** Cinco minutos de trabajo que habilitan dos variables experimentales.
-5. **Contador de eventos en el generador (tarea 55).** Sin él no hay métricas de integridad.
-6. **Estado del arte y validación con el tutor (tareas 7 y 8).** No dependen del código y están en el camino crítico. Conviene avanzarlas en paralelo.
+5. **Estado del arte y validación con el tutor (tareas 7 y 8).** No dependen del código y están en el camino crítico. Conviene avanzarlas en paralelo.
 
 ---
 
